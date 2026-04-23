@@ -315,12 +315,20 @@ def excel_ve_mail(veriler):
             safe_sheet_name = "Bilinmeyen"
         ws = wb.create_sheet(title=safe_sheet_name)
 
-        ws.append(["Cari Adı", "Ait Olduğu Şirket", "Bakiye (TL)"])
+        basliklar = ["Cari Adı", "Ait Olduğu Şirket", "Bakiye (TL)"]
+        ws.append(basliklar)
 
+        header_alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
         for cell in ws[1]:
             cell.fill = header_fill
             cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.alignment = header_alignment
+            cell.border = thin_border
+
+        # Başlıkların iki satıra sararken kesilmemesi için yeterli yükseklik
+        ws.row_dimensions[1].height = 30
 
         for cari in cari_listesi:
             ws.append([cari['ad'], cari['sirket'], cari['bakiye']])
@@ -332,16 +340,29 @@ def excel_ve_mail(veriler):
                 if cell.column == 3:
                     cell.number_format = '#,##0.00'
 
-        for col in ws.columns:
-            max_length = 0
-            col_letter = col[0].column_letter
-            for cell in col:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except Exception:
-                    pass
-            ws.column_dimensions[col_letter].width = min((max_length + 5), 50)
+        # Sütun genişlikleri: veriye göre otomatik, ama başlıktaki en uzun
+        # kelime de sığsın diye minimum garanti ediliyor. Üst sınır 40.
+        for col_idx in range(1, len(basliklar) + 1):
+            col_letter = ws.cell(row=1, column=col_idx).column_letter
+            max_data_len = 0
+            for row in ws.iter_rows(min_row=2, max_row=ws.max_row,
+                                    min_col=col_idx, max_col=col_idx):
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    if isinstance(cell.value, (int, float)):
+                        text = f"{cell.value:,.2f}"
+                    else:
+                        text = str(cell.value)
+                    if len(text) > max_data_len:
+                        max_data_len = len(text)
+
+            header_text = basliklar[col_idx - 1]
+            min_for_header = max(
+                (len(w) for w in header_text.split()), default=len(header_text)
+            )
+            width = max(min_for_header + 2, max_data_len + 3)
+            ws.column_dimensions[col_letter].width = min(width, 40)
 
         tablo_ref = f"A1:C{ws.max_row}"
         tablo_ismi = "Tbl_" + re.sub(r'[^a-zA-Z0-9]', '', sirket_adi)
