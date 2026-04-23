@@ -52,7 +52,8 @@ source "$APP_DIR/venv/bin/activate"
 pip install --upgrade pip --quiet
 pip install --quiet requests openpyxl
 
-echo "[4/6] run.sh wrapper'ı yazılıyor..."
+echo "[4/7] run.sh (elle test) ve run_and_stop.sh (zamanlı) yazılıyor..."
+# Manuel test için - kapanmaz
 cat > "$APP_DIR/run.sh" <<EOF
 #!/bin/bash
 cd "$APP_DIR"
@@ -63,13 +64,33 @@ set +a
 EOF
 chmod +x "$APP_DIR/run.sh"
 
-echo "[5/6] Cron işi ekleniyor (haftalık - Pazartesi 09:00 TR / 06:00 UTC)..."
-CRON_LINE="0 6 * * 1 $APP_DIR/run.sh >> $APP_DIR/cron.log 2>&1"
-( crontab -l 2>/dev/null | grep -v "$APP_DIR/run.sh" ; echo "$CRON_LINE" ) | crontab -
-echo "  -> Cron kuruldu:"
-crontab -l | grep "$APP_DIR/run.sh"
+# Zamanlı çalıştırma için - iş bitince (başarılı ya da hatalı) instance'ı stop eder
+cat > "$APP_DIR/run_and_stop.sh" <<EOF
+#!/bin/bash
+# Bu script cron tarafından çağrılır. Amacı: bot çalışsın, sonra instance kapansın.
+# shutdown komutu çalışırken varsayılan kapanış davranışı "stop" olduğu için
+# instance sonlandırılmaz, sadece durdurulur - veriler kalır.
+echo "[\$(date)] run_and_stop başladı"
+"$APP_DIR/run.sh"
+EXIT=\$?
+echo "[\$(date)] bot çıkış kodu=\$EXIT, 60 sn sonra sunucu kapatılıyor."
+# 60 sn gecikme: cron log yazımı ve varsa mail gönderimi tamamlansın
+sudo /sbin/shutdown -h +1 "ClickUp bot tamamlandi, instance stop ediliyor"
+EOF
+chmod +x "$APP_DIR/run_and_stop.sh"
 
-echo "[6/6] .env dosyası hazırlanıyor..."
+echo "[5/7] ec2-user için şifresiz shutdown yetkisi veriliyor..."
+SUDOERS_FILE="/etc/sudoers.d/clickup-bot-shutdown"
+echo "ec2-user ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee "$SUDOERS_FILE" >/dev/null
+sudo chmod 440 "$SUDOERS_FILE"
+
+echo "[6/7] Cron işi ekleniyor (Salı 09:00 TR / 06:00 UTC)..."
+CRON_LINE="0 6 * * 2 $APP_DIR/run_and_stop.sh >> $APP_DIR/cron.log 2>&1"
+( crontab -l 2>/dev/null | grep -v "$APP_DIR/run" ; echo "$CRON_LINE" ) | crontab -
+echo "  -> Cron kuruldu:"
+crontab -l | grep "$APP_DIR/run"
+
+echo "[7/7] .env dosyası hazırlanıyor..."
 if [ ! -f "$APP_DIR/.env" ]; then
     cp "$APP_DIR/.env.example" "$APP_DIR/.env"
     chmod 600 "$APP_DIR/.env"
@@ -88,10 +109,10 @@ echo ""
 echo "Açılan ekranda CLICKUP_API_TOKEN= ve SMTP_PASSWORD= satırlarını doldur."
 echo "Kaydetmek için:  Ctrl+O  Enter  Ctrl+X"
 echo ""
-echo "Sonra manuel test için:"
-echo ""
+echo "ELLE test için (instance kapanmaz):"
 echo "    $APP_DIR/run.sh"
 echo ""
-echo "Mail geldiyse her şey hazır. Cron her Pazartesi 09:00'da otomatik çalışır."
+echo "Cron: her Salı 09:00 TR'de run_and_stop.sh çalışır -> mail atılır -> instance stop."
+echo "Instance'ın Salı 08:50'de başlaması için EventBridge Scheduler'ı AWS Console'dan kur."
 echo "Logları izlemek için:  tail -f $APP_DIR/cron.log"
 echo ""
