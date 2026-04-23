@@ -19,19 +19,31 @@ from collections import defaultdict
 # ==========================================
 #              AYARLAR BÖLÜMÜ
 # ==========================================
-API_TOKEN = "pk_4732091_5YZ9OW8J67SHOZVDU178PNNVPI606Z2J"
-WORKSPACE_ID = "2598108"
-SPACE_ADI = "Cariler"
-ALAN_ID = "3c3d2b8c-5346-407f-862b-8ab13f173519"
-TARIH_ALAN_ID = "885e079e-dee7-490f-a42a-4d6ea6fa94a8"
-SIRKET_ALAN_ID = "26c369ca-6a0d-48fe-8132-40df9ca5c5b0"
+# Hassas bilgiler ortam değişkenlerinden okunur. Bkz: .env.example
+def _required_env(name):
+    val = os.environ.get(name)
+    if not val:
+        raise RuntimeError(
+            f"Eksik ortam değişkeni: {name}. .env dosyanı kontrol et "
+            f"veya 'set -a; source .env; set +a' ile yükle."
+        )
+    return val
+
+
+API_TOKEN = _required_env("CLICKUP_API_TOKEN")
+GONDEREN_SIFRE = _required_env("SMTP_PASSWORD")
+
+WORKSPACE_ID = os.environ.get("CLICKUP_WORKSPACE_ID", "2598108")
+SPACE_ADI = os.environ.get("CLICKUP_SPACE_ADI", "Cariler")
+ALAN_ID = os.environ.get("CLICKUP_ALAN_ID", "3c3d2b8c-5346-407f-862b-8ab13f173519")
+TARIH_ALAN_ID = os.environ.get("CLICKUP_TARIH_ALAN_ID", "885e079e-dee7-490f-a42a-4d6ea6fa94a8")
+SIRKET_ALAN_ID = os.environ.get("CLICKUP_SIRKET_ALAN_ID", "26c369ca-6a0d-48fe-8132-40df9ca5c5b0")
 MILAT_TIMESTAMP = int(datetime.datetime(2024, 1, 1).timestamp() * 1000)
 
-GONDEREN_MAIL = "clickup@solarfame.com"
-GONDEREN_SIFRE = "evfsewhpbqmuzsfh"
-ALICI_MAIL = "solarframemuhasebe@solarfame.com"
-SMTP_SUNUCU = "smtp.yandex.com.tr"
-SMTP_PORT = 465
+GONDEREN_MAIL = os.environ.get("SMTP_FROM", "clickup@solarfame.com")
+ALICI_MAIL = os.environ.get("MAIL_TO", "solarframemuhasebe@solarfame.com")
+SMTP_SUNUCU = os.environ.get("SMTP_HOST", "smtp.yandex.com.tr")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 
 SF_ORANGE = "F26A21"
 SF_GRAY = "595959"
