@@ -3,6 +3,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import datetime
 import re
+import signal
 import smtplib
 import sys
 import time
@@ -53,6 +54,7 @@ MAX_PAGES_PER_LIST = 200          # Liste başına en fazla 200 sayfa (=20.000 t
 REQUEST_TIMEOUT = (10, 25)        # (connect, read) saniye
 BASE_SLEEP = 0.7                  # Her istek arasında bekleme
 MAX_429_RETRIES = 6               # Tek sayfa için 429 tekrar denemesi
+LIST_WATCHDOG_SECONDS = 120       # Bir liste 120 sn içinde bitmezse atla
 
 headers = {"Authorization": API_TOKEN, "Content-Type": "application/json"}
 
@@ -60,6 +62,14 @@ headers = {"Authorization": API_TOKEN, "Content-Type": "application/json"}
 def log(msg):
     """stdout buffer'ını anında boşalt - terminalde donmuş gibi görünmesin."""
     print(msg, flush=True)
+
+
+class _WatchdogTimeout(Exception):
+    """Bir liste tarama LIST_WATCHDOG_SECONDS içinde bitmezse fırlatılır."""
+
+
+def _watchdog_handler(signum, frame):
+    raise _WatchdogTimeout()
 
 
 def get_session():
@@ -243,7 +253,18 @@ def verileri_cek_ve_raporla():
             sirket_bakiyeleri = defaultdict(float)
 
             log(f"[{idx}/{len(all_lists)}] 🔍 {l_name} taranıyor...")
-            tasks = fetch_list_tasks(session, l_id, l_name)
+            # Wall-clock watchdog: liste LIST_WATCHDOG_SECONDS içinde bitmezse
+            # SIGALRM yolla, fetch_list_tasks exception ile düşsün, atlayıp devam et.
+            tasks = []
+            try:
+                signal.signal(signal.SIGALRM, _watchdog_handler)
+                signal.alarm(LIST_WATCHDOG_SECONDS)
+                tasks = fetch_list_tasks(session, l_id, l_name)
+            except _WatchdogTimeout:
+                log(f"   ⏱️ '{l_name}' {LIST_WATCHDOG_SECONDS}s içinde bitmedi, atlandı.")
+            finally:
+                signal.alarm(0)
+
             toplam_islenen_task += len(tasks)
 
             for t in tasks:
