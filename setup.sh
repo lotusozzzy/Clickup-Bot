@@ -52,7 +52,7 @@ source "$APP_DIR/venv/bin/activate"
 pip install --upgrade pip --quiet
 pip install --quiet requests openpyxl
 
-echo "[4/7] run.sh (elle test) ve run_and_stop.sh (zamanlı) yazılıyor..."
+echo "[4/7] run.sh, run_and_stop.sh ve run_daily_and_stop.sh yazılıyor..."
 # Manuel test için - kapanmaz
 cat > "$APP_DIR/run.sh" <<EOF
 #!/bin/bash
@@ -64,20 +64,33 @@ set +a
 EOF
 chmod +x "$APP_DIR/run.sh"
 
-# Zamanlı çalıştırma için - iş bitince (başarılı ya da hatalı) instance'ı stop eder
+# Haftalık (Salı) bakiye raporu için - sonunda instance'ı kapatır
 cat > "$APP_DIR/run_and_stop.sh" <<EOF
 #!/bin/bash
-# Bu script cron tarafından çağrılır. Amacı: bot çalışsın, sonra instance kapansın.
-# shutdown komutu çalışırken varsayılan kapanış davranışı "stop" olduğu için
-# instance sonlandırılmaz, sadece durdurulur - veriler kalır.
+# Haftalık bakiye raporu wrapper'ı.
 echo "[\$(date)] run_and_stop başladı"
 "$APP_DIR/run.sh"
 EXIT=\$?
 echo "[\$(date)] bot çıkış kodu=\$EXIT, 60 sn sonra sunucu kapatılıyor."
-# 60 sn gecikme: cron log yazımı ve varsa mail gönderimi tamamlansın
 sudo /sbin/shutdown -h +1 "ClickUp bot tamamlandi, instance stop ediliyor"
 EOF
 chmod +x "$APP_DIR/run_and_stop.sh"
+
+# Günlük (Pzt-Cum) tarih değişiklik raporu için - sonunda instance'ı kapatır
+cat > "$APP_DIR/run_daily_and_stop.sh" <<EOF
+#!/bin/bash
+# Günlük tarih değişiklik raporu wrapper'ı.
+echo "[\$(date)] run_daily_and_stop başladı"
+cd "$APP_DIR"
+set -a
+source "$APP_DIR/.env"
+set +a
+"$APP_DIR/venv/bin/python" "$APP_DIR/clickup_due_report.py"
+EXIT=\$?
+echo "[\$(date)] günlük rapor çıkış kodu=\$EXIT, 60 sn sonra sunucu kapatılıyor."
+sudo /sbin/shutdown -h +1 "ClickUp gunluk rapor tamamlandi, instance stop ediliyor"
+EOF
+chmod +x "$APP_DIR/run_daily_and_stop.sh"
 
 CURRENT_USER="$(id -un)"
 echo "[5/7] $CURRENT_USER için şifresiz shutdown yetkisi veriliyor..."
@@ -85,9 +98,12 @@ SUDOERS_FILE="/etc/sudoers.d/clickup-bot-shutdown"
 echo "$CURRENT_USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee "$SUDOERS_FILE" >/dev/null
 sudo chmod 440 "$SUDOERS_FILE"
 
-echo "[6/7] Cron işi ekleniyor (Salı 09:00 TR / 06:00 UTC)..."
-CRON_LINE="0 6 * * 2 $APP_DIR/run_and_stop.sh >> $APP_DIR/cron.log 2>&1"
-( crontab -l 2>/dev/null | grep -v "$APP_DIR/run" ; echo "$CRON_LINE" ) | crontab -
+echo "[6/7] Cron işleri ekleniyor (haftalık + günlük)..."
+# Haftalık bakiye: Salı 09:00 TR (06:00 UTC)
+WEEKLY_LINE="0 6 * * 2 $APP_DIR/run_and_stop.sh >> $APP_DIR/cron.log 2>&1"
+# Günlük tarih değişiklik raporu: Pzt-Cum 21:00 TR (18:00 UTC)
+DAILY_LINE="0 18 * * 1-5 $APP_DIR/run_daily_and_stop.sh >> $APP_DIR/cron_daily.log 2>&1"
+( crontab -l 2>/dev/null | grep -v "$APP_DIR/run" ; echo "$WEEKLY_LINE" ; echo "$DAILY_LINE" ) | crontab -
 echo "  -> Kurulu cron satırları:"
 crontab -l 2>/dev/null | grep "$APP_DIR/run" || echo "  (cron satırı bulunamadı - lütfen 'crontab -l' ile manuel kontrol et)"
 
@@ -111,9 +127,20 @@ echo "Açılan ekranda CLICKUP_API_TOKEN= ve SMTP_PASSWORD= satırlarını doldu
 echo "Kaydetmek için:  Ctrl+O  Enter  Ctrl+X"
 echo ""
 echo "ELLE test için (instance kapanmaz):"
-echo "    $APP_DIR/run.sh"
+echo "  Bakiye raporu (haftalık):  $APP_DIR/run.sh"
+echo "  Tarih değişiklik raporu :  cd $APP_DIR && set -a; source .env; set +a; venv/bin/python clickup_due_report.py"
 echo ""
-echo "Cron: her Salı 09:00 TR'de run_and_stop.sh çalışır -> mail atılır -> instance stop."
-echo "Instance'ın Salı 08:50'de başlaması için EventBridge Scheduler'ı AWS Console'dan kur."
-echo "Logları izlemek için:  tail -f $APP_DIR/cron.log"
+echo "Otomatik cron'lar (TR saati):"
+echo "  Salı 09:00            -> run_and_stop.sh         (haftalık bakiye + instance stop)"
+echo "  Pzt-Cum 21:00         -> run_daily_and_stop.sh   (günlük tarih raporu + instance stop)"
+echo ""
+echo "AWS EventBridge Scheduler tarafında olması gerekenler:"
+echo "  Clickup-Uyandir       -> Salı 08:50 start"
+echo "  Clickup-Uyut          -> Salı 10:00 stop (yedek)"
+echo "  Clickup-Daily-Uyandir -> Pzt-Cum 20:50 start"
+echo "  Clickup-Daily-Uyut    -> Pzt-Cum 21:30 stop (yedek)"
+echo ""
+echo "Logları izlemek için:"
+echo "  tail -f $APP_DIR/cron.log         (haftalık)"
+echo "  tail -f $APP_DIR/cron_daily.log   (günlük)"
 echo ""
