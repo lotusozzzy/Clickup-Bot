@@ -79,16 +79,17 @@ sudo /sbin/shutdown -h +1 "ClickUp bot tamamlandi, instance stop ediliyor"
 EOF
 chmod +x "$APP_DIR/run_and_stop.sh"
 
-echo "[5/7] ec2-user için şifresiz shutdown yetkisi veriliyor..."
+CURRENT_USER="$(id -un)"
+echo "[5/7] $CURRENT_USER için şifresiz shutdown yetkisi veriliyor..."
 SUDOERS_FILE="/etc/sudoers.d/clickup-bot-shutdown"
-echo "ec2-user ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee "$SUDOERS_FILE" >/dev/null
+echo "$CURRENT_USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee "$SUDOERS_FILE" >/dev/null
 sudo chmod 440 "$SUDOERS_FILE"
 
 echo "[6/7] Cron işi ekleniyor (Salı 09:00 TR / 06:00 UTC)..."
 CRON_LINE="0 6 * * 2 $APP_DIR/run_and_stop.sh >> $APP_DIR/cron.log 2>&1"
 ( crontab -l 2>/dev/null | grep -v "$APP_DIR/run" ; echo "$CRON_LINE" ) | crontab -
-echo "  -> Cron kuruldu:"
-crontab -l | grep "$APP_DIR/run"
+echo "  -> Kurulu cron satırları:"
+crontab -l 2>/dev/null | grep "$APP_DIR/run" || echo "  (cron satırı bulunamadı - lütfen 'crontab -l' ile manuel kontrol et)"
 
 echo "[7/7] .env dosyası hazırlanıyor..."
 if [ ! -f "$APP_DIR/.env" ]; then
