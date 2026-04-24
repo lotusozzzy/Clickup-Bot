@@ -219,18 +219,19 @@ def fetch_list_tasks(session, l_id, l_name):
 def verileri_cek_ve_raporla():
     log("🚀 Başlatılıyor... Veriler çekiliyor.")
     raporlanacak_cariler = []
+    atlanan_listeler = []
     session = get_session()
 
     try:
         r = safe_get(session, f"https://api.clickup.com/api/v2/team/{WORKSPACE_ID}/space", attempt_label="spaces")
         if r is None or r.status_code != 200:
             log("❌ Space listesi alınamadı.")
-            return raporlanacak_cariler
+            return raporlanacak_cariler, atlanan_listeler
         spaces = r.json().get('spaces', [])
         space_id = next((s['id'] for s in spaces if s['name'].lower() == SPACE_ADI.lower()), None)
         if space_id is None:
             log(f"❌ '{SPACE_ADI}' isimli space bulunamadı.")
-            return raporlanacak_cariler
+            return raporlanacak_cariler, atlanan_listeler
 
         all_lists = []
         r_lists = safe_get(session, f"https://api.clickup.com/api/v2/space/{space_id}/list", attempt_label="space lists")
@@ -262,6 +263,10 @@ def verileri_cek_ve_raporla():
                 tasks = fetch_list_tasks(session, l_id, l_name)
             except _WatchdogTimeout:
                 log(f"   ⏱️ '{l_name}' {LIST_WATCHDOG_SECONDS}s içinde bitmedi, atlandı.")
+                atlanan_listeler.append({
+                    "ad": l_name,
+                    "sebep": f"Zaman aşımı (>{LIST_WATCHDOG_SECONDS}s)",
+                })
             finally:
                 signal.alarm(0)
 
@@ -306,11 +311,15 @@ def verileri_cek_ve_raporla():
     except Exception as e:
         log(f"\n❌ Kritik Hata: {e}")
 
-    return raporlanacak_cariler
+    if atlanan_listeler:
+        log(f"\n⏱️ Zaman aşımına uğrayıp atlanan {len(atlanan_listeler)} liste var, rapora ekleniyor.")
+
+    return raporlanacak_cariler, atlanan_listeler
 
 
-def excel_ve_mail(veriler):
-    if not veriler:
+def excel_ve_mail(veriler, atlanan_listeler=None):
+    atlanan_listeler = atlanan_listeler or []
+    if not veriler and not atlanan_listeler:
         log("ℹ️ Raporlanacak veri yok, mail gönderilmiyor.")
         return
     dosya = f"Cari_Rapor_{datetime.datetime.now().strftime('%d_%m_%Y')}.xlsx"
@@ -396,10 +405,68 @@ def excel_ve_mail(veriler):
         tab.tableStyleInfo = style
         ws.add_table(tab)
 
+    # Watchdog ile atlanan listeler için ayrı sekme (varsa)
+    if atlanan_listeler:
+        ws_skip = wb.create_sheet(title="Atlanan Listeler")
+        skip_basliklar = ["Liste Adı", "Atlanma Sebebi"]
+        ws_skip.append(skip_basliklar)
+
+        for cell in ws_skip[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True
+            )
+            cell.border = thin_border
+        ws_skip.row_dimensions[1].height = 30
+
+        for item in atlanan_listeler:
+            ws_skip.append([item["ad"], item["sebep"]])
+
+        for row in ws_skip.iter_rows(min_row=2, max_row=ws_skip.max_row,
+                                     min_col=1, max_col=2):
+            for cell in row:
+                cell.alignment = wrap_alignment
+                cell.border = thin_border
+
+        for col_idx in range(1, len(skip_basliklar) + 1):
+            col_letter = ws_skip.cell(row=1, column=col_idx).column_letter
+            max_data_len = 0
+            for row in ws_skip.iter_rows(min_row=2, max_row=ws_skip.max_row,
+                                         min_col=col_idx, max_col=col_idx):
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    text = str(cell.value)
+                    if len(text) > max_data_len:
+                        max_data_len = len(text)
+            header_text = skip_basliklar[col_idx - 1]
+            min_for_header = max(
+                (len(w) for w in header_text.split()), default=len(header_text)
+            )
+            width = max(min_for_header + 2, max_data_len + 3)
+            ws_skip.column_dimensions[col_letter].width = min(width, 50)
+
+        skip_tablo_ref = f"A1:B{ws_skip.max_row}"
+        skip_tab = Table(displayName="Tbl_Atlanan_Listeler", ref=skip_tablo_ref)
+        skip_tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleLight1", showFirstColumn=False,
+            showLastColumn=False, showRowStripes=True, showColumnStripes=False
+        )
+        ws_skip.add_table(skip_tab)
+
     wb.save(dosya)
 
     msg = MIMEMultipart()
     msg['From'], msg['To'], msg['Subject'] = GONDEREN_MAIL, ALICI_MAIL, "Haftalık Bakiye Raporu"
+
+    atlanan_uyari = ""
+    if atlanan_listeler:
+        atlanan_uyari = (
+            f"<p style=\"color:#cc6600;\"><b>Uyarı:</b> {len(atlanan_listeler)} liste "
+            f"zaman aşımı (>{LIST_WATCHDOG_SECONDS}s) nedeniyle taranamadı. "
+            f"Excel'in son sekmesindeki <b>\"Atlanan Listeler\"</b> tabına bakabilirsiniz.</p>"
+        )
 
     html_govde = f"""
     <html>
@@ -407,6 +474,7 @@ def excel_ve_mail(veriler):
         <h2 style="color: #{SF_ORANGE};">Haftalık Bakiye Raporu</h2>
         <p>Açık cariler, ait oldukları şirketlere göre sekmelere ayrılarak ekteki Excel dosyasında sunulmuştur.</p>
         <p><i>Not: Başlıklardaki ok işaretlerine tıklayarak bakiyeleri büyükten küçüğe sıralayabilir veya belirli bir cariyi filtreleyebilirsiniz.</i></p>
+        {atlanan_uyari}
         <br>
         <p>İyi çalışmalar.</p>
       </body>
@@ -434,5 +502,5 @@ def excel_ve_mail(veriler):
 
 
 if __name__ == "__main__":
-    sonuc = verileri_cek_ve_raporla()
-    excel_ve_mail(sonuc)
+    cariler, atlananlar = verileri_cek_ve_raporla()
+    excel_ve_mail(cariler, atlananlar)
