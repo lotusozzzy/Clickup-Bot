@@ -92,6 +92,130 @@ sudo /sbin/shutdown -h +1 "ClickUp gunluk rapor tamamlandi, instance stop ediliy
 EOF
 chmod +x "$APP_DIR/run_daily_and_stop.sh"
 
+# DETACHED ÇALIŞTIRMA: SSH oturumundan bağımsız, terminal kapansa da koşar.
+# nohup ile arka plana atılır, çıktı manual.log'a yazılır.
+cat > "$APP_DIR/run_detached.sh" <<EOF
+#!/bin/bash
+# Bakiye raporunu SSH'tan bağımsız (detached) başlatır.
+# Bağlantın koparsa bile çalışmaya devam eder.
+APP_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+LOG="\$APP_DIR/manual.log"
+
+# Önceki çalışan instance'ları temizle
+if pgrep -f "\$APP_DIR/clickup_bot.py" >/dev/null 2>&1; then
+    echo "⚠️ Önceden çalışan bir clickup_bot.py süreci var, durduruluyor..."
+    pkill -9 -f "\$APP_DIR/clickup_bot.py"
+    sleep 2
+fi
+
+# Logu sıfırla (eski log otomatik silinir)
+: > "\$LOG"
+
+# nohup + setsid ile tamamen detached başlat
+setsid nohup "\$APP_DIR/run.sh" > "\$LOG" 2>&1 < /dev/null &
+PID=\$!
+disown 2>/dev/null || true
+sleep 2
+
+if kill -0 "\$PID" 2>/dev/null; then
+    echo ""
+    echo "✅ Bakiye raporu arka planda başlatıldı."
+    echo "   PID: \$PID"
+    echo "   Log: \$LOG"
+    echo ""
+    echo "Şimdi tarayıcı sekmesini KAPATABİLİRSİN, script çalışmaya devam eder."
+    echo ""
+    echo "Canlı izlemek için (Ctrl+C ile çıkış, script ölmez):"
+    echo "    tail -f \$LOG"
+    echo ""
+    echo "Durum kontrolü :  \$APP_DIR/status.sh"
+    echo "Durdurmak için :  \$APP_DIR/stop.sh"
+else
+    echo "❌ Başlatılamadı. Logu kontrol et:"
+    echo "    cat \$LOG"
+    exit 1
+fi
+EOF
+chmod +x "$APP_DIR/run_detached.sh"
+
+# Aynı şey günlük rapor için
+cat > "$APP_DIR/run_daily_detached.sh" <<EOF
+#!/bin/bash
+APP_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+LOG="\$APP_DIR/manual_daily.log"
+
+if pgrep -f "\$APP_DIR/clickup_due_report.py" >/dev/null 2>&1; then
+    echo "⚠️ Önceden çalışan bir clickup_due_report.py süreci var, durduruluyor..."
+    pkill -9 -f "\$APP_DIR/clickup_due_report.py"
+    sleep 2
+fi
+
+: > "\$LOG"
+cd "\$APP_DIR"
+set -a; source "\$APP_DIR/.env"; set +a
+setsid nohup "\$APP_DIR/venv/bin/python" "\$APP_DIR/clickup_due_report.py" > "\$LOG" 2>&1 < /dev/null &
+PID=\$!
+disown 2>/dev/null || true
+sleep 2
+
+if kill -0 "\$PID" 2>/dev/null; then
+    echo "✅ Günlük rapor arka planda başlatıldı (PID \$PID, log: \$LOG)."
+    echo "Canlı izle:  tail -f \$LOG"
+else
+    echo "❌ Başlatılamadı. Log: \$LOG"
+    exit 1
+fi
+EOF
+chmod +x "$APP_DIR/run_daily_detached.sh"
+
+# Durum görüntüleme
+cat > "$APP_DIR/status.sh" <<EOF
+#!/bin/bash
+APP_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+echo "===== ClickUp Bot Durumu ====="
+echo ""
+
+for SCRIPT in clickup_bot.py clickup_due_report.py; do
+    PID=\$(pgrep -f "\$APP_DIR/\$SCRIPT" | head -1)
+    if [ -n "\$PID" ]; then
+        ELAPSED=\$(ps -o etime= -p "\$PID" 2>/dev/null | tr -d ' ')
+        echo "✅ \$SCRIPT — ÇALIŞIYOR (PID \$PID, süre \$ELAPSED)"
+    else
+        echo "⏸️  \$SCRIPT — çalışmıyor"
+    fi
+done
+
+echo ""
+echo "----- Son loglar -----"
+for LOG in manual.log manual_daily.log cron.log cron_daily.log; do
+    if [ -f "\$APP_DIR/\$LOG" ]; then
+        SIZE=\$(stat -c%s "\$APP_DIR/\$LOG" 2>/dev/null || stat -f%z "\$APP_DIR/\$LOG")
+        echo ""
+        echo "[\$LOG] (\$SIZE bayt) son 5 satır:"
+        tail -5 "\$APP_DIR/\$LOG" | sed 's/^/  /'
+    fi
+done
+EOF
+chmod +x "$APP_DIR/status.sh"
+
+# Manuel durdurma
+cat > "$APP_DIR/stop.sh" <<EOF
+#!/bin/bash
+APP_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+KILLED=0
+for SCRIPT in clickup_bot.py clickup_due_report.py; do
+    if pgrep -f "\$APP_DIR/\$SCRIPT" >/dev/null 2>&1; then
+        pkill -9 -f "\$APP_DIR/\$SCRIPT"
+        KILLED=1
+        echo "⛔ \$SCRIPT durduruldu."
+    fi
+done
+if [ \$KILLED -eq 0 ]; then
+    echo "ℹ️  Çalışan ClickUp bot süreci yoktu."
+fi
+EOF
+chmod +x "$APP_DIR/stop.sh"
+
 CURRENT_USER="$(id -un)"
 echo "[5/7] $CURRENT_USER için şifresiz shutdown yetkisi veriliyor..."
 SUDOERS_FILE="/etc/sudoers.d/clickup-bot-shutdown"
@@ -126,9 +250,15 @@ echo ""
 echo "Açılan ekranda CLICKUP_API_TOKEN= ve SMTP_PASSWORD= satırlarını doldur."
 echo "Kaydetmek için:  Ctrl+O  Enter  Ctrl+X"
 echo ""
-echo "ELLE test için (instance kapanmaz):"
-echo "  Bakiye raporu (haftalık):  $APP_DIR/run.sh"
-echo "  Tarih değişiklik raporu :  cd $APP_DIR && set -a; source .env; set +a; venv/bin/python clickup_due_report.py"
+echo "ELLE TEST (önerilen — bağlantı koparsa bile çalışır):"
+echo "  Bakiye raporu        :  $APP_DIR/run_detached.sh"
+echo "  Günlük tarih raporu  :  $APP_DIR/run_daily_detached.sh"
+echo "  Durumu gör           :  $APP_DIR/status.sh"
+echo "  Durdur               :  $APP_DIR/stop.sh"
+echo "  Canlı log            :  tail -f $APP_DIR/manual.log"
+echo ""
+echo "(Foreground çalıştırma — bağlantı kopunca ölür):"
+echo "  $APP_DIR/run.sh"
 echo ""
 echo "Otomatik cron'lar (TR saati):"
 echo "  Salı 09:00            -> run_and_stop.sh         (haftalık bakiye + instance stop)"
