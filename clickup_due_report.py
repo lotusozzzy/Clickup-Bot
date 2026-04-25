@@ -17,6 +17,7 @@ edilir; o da değerleri os.environ'dan okur.
 import datetime
 import json
 import os
+import signal
 import smtplib
 import sys
 import time
@@ -34,12 +35,15 @@ from clickup_bot import (
     BASE_SLEEP,
     GONDEREN_MAIL,
     GONDEREN_SIFRE,
+    LIST_WATCHDOG_SECONDS,
     MAX_PAGES_PER_LIST,
     SF_GRAY,
     SF_ORANGE,
     SMTP_PORT,
     SMTP_SUNUCU,
     WORKSPACE_ID,
+    _WatchdogTimeout,
+    _watchdog_handler,
     get_session,
     log,
     safe_get,
@@ -170,18 +174,35 @@ def fetch_open_tasks(session, list_id, list_name):
 def build_current_snapshot(session):
     """Açık task'ların mevcut due_date durumunu çıkarır.
 
-    Dönen dict: {task_id: {due_date, name, url, list_name, space_name}}.
+    Dönen tuple: (snapshot_dict, atlanan_listeler).
+    snapshot_dict: {task_id: {due_date, name, url, list_name, space_name}}
+    atlanan_listeler: watchdog devreye girip yarıda kesilen liste isimleri.
     """
     snapshot = {}
+    atlanan_listeler = []
     spaces = get_target_spaces(session)
     log(f"📦 {len(spaces)} space taranacak (Cariler hariç).")
+    baslangic = time.time()
     for s in spaces:
         space_name = s.get("name", "")
         lists = get_all_lists_in_space(session, s["id"], space_name)
         log(f"  🗂️  '{space_name}' içinde {len(lists)} liste.")
         for l in lists:
             log(f"    🔍 {l['name']} taranıyor...")
-            tasks = fetch_open_tasks(session, l["id"], l["name"])
+            tasks = []
+            try:
+                signal.signal(signal.SIGALRM, _watchdog_handler)
+                signal.alarm(LIST_WATCHDOG_SECONDS)
+                tasks = fetch_open_tasks(session, l["id"], l["name"])
+            except _WatchdogTimeout:
+                log(f"      ⏱️ '{l['name']}' {LIST_WATCHDOG_SECONDS}s içinde bitmedi, atlandı.")
+                atlanan_listeler.append({
+                    "ad": f"{l['name']} ({space_name})",
+                    "sebep": f"Zaman aşımı (>{LIST_WATCHDOG_SECONDS}s)",
+                })
+            finally:
+                signal.alarm(0)
+
             for t in tasks:
                 tid = t.get("id")
                 if not tid:
@@ -193,7 +214,10 @@ def build_current_snapshot(session):
                     "list_name": l["name"],
                     "space_name": space_name,
                 }
-    return snapshot
+    gecen = int(time.time() - baslangic)
+    log(f"✓ Tarama bitti: {len(snapshot)} açık task, {gecen}s, "
+        f"{len(atlanan_listeler)} liste atlandı.")
+    return snapshot, atlanan_listeler
 
 
 def load_previous_snapshot():
@@ -377,7 +401,8 @@ def _add_sheet(wb, title, headers, rows, table_name, header_fill, header_font,
         ws.add_table(tab)
 
 
-def write_excel(changed_with, changed_no, removed):
+def write_excel(changed_with, changed_no, removed, atlanan_listeler=None):
+    atlanan_listeler = atlanan_listeler or []
     dosya = f"Tarih_Degisiklik_Raporu_{datetime.datetime.now().strftime('%d_%m_%Y')}.xlsx"
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -419,6 +444,14 @@ def write_excel(changed_with, changed_no, removed):
         header_fill, header_font, wrap_alignment, thin_border,
     )
 
+    if atlanan_listeler:
+        _add_sheet(
+            wb, "Atlanan Listeler", ["Liste Adı", "Atlanma Sebebi"],
+            [[a["ad"], a["sebep"]] for a in atlanan_listeler],
+            "Tbl_Atlanan",
+            header_fill, header_font, wrap_alignment, thin_border,
+        )
+
     wb.save(dosya)
     return dosya
 
@@ -430,6 +463,14 @@ def send_mail(dosya, me_info, summary, is_first_run):
     msg['To'] = ALICI_MAIL
     msg['Subject'] = f"Günlük Tarih Değişikliği Raporu - {konu_tarih}"
 
+    atlanan_uyari = ""
+    atlanan_cnt = summary.get("atlanan", 0)
+    if atlanan_cnt:
+        atlanan_uyari = (
+            f"<p style='color:#cc6600;'><b>Uyarı:</b> {atlanan_cnt} liste zaman aşımı "
+            f"nedeniyle taranamadı. Excel'in <b>Atlanan Listeler</b> sekmesine bakın.</p>"
+        )
+
     if is_first_run:
         body = f"""
         <html><body style="font-family: Arial, sans-serif; color: #{SF_GRAY};">
@@ -437,6 +478,7 @@ def send_mail(dosya, me_info, summary, is_first_run):
           <p>Bugün ilk kez çalıştırıldığı için karşılaştıracak geçmiş veri yok.
              <b>{summary['toplam_task']}</b> açık task izlemeye alındı.</p>
           <p>Yarın akşamki rapordan itibaren tarih değişiklikleri görünecek.</p>
+          {atlanan_uyari}
           <p style="color: #888; font-size: 12px;">
             Çalıştıran: {me_info.get('username', '')} ({me_info.get('email', '')})
           </p>
@@ -452,6 +494,7 @@ def send_mail(dosya, me_info, summary, is_first_run):
             <li><b>Tarih değişti - yorum yok / sadece sen yorumlamışsın:</b> {summary['degisti_yorumsuz']}</li>
             <li><b>Tarih kaldırıldı:</b> {summary['kaldirildi']}</li>
           </ul>
+          {atlanan_uyari}
           <p style="color: #888; font-size: 12px;">
             Çalıştıran: {me_info.get('username', '')} ({me_info.get('email', '')}) — bu kullanıcının
             yaptığı değişikliklere ait yorumlar 2. sekmeye düşer.
@@ -486,15 +529,17 @@ def main():
         f"yorumladığı değişiklikler 'yorumsuz' tarafına gidecek.")
 
     log("📸 Güncel snapshot alınıyor...")
-    current = build_current_snapshot(session)
-    log(f"✓ Toplam {len(current)} açık task bulundu.")
+    current, atlanan_listeler = build_current_snapshot(session)
 
     prev = load_previous_snapshot()
     if prev is None:
         log("ℹ️ Önceki snapshot yok — ilk çalıştırma. Karşılaştırma yapılmıyor.")
         save_snapshot(current)
         try:
-            send_mail(None, me, {"toplam_task": len(current)}, True)
+            send_mail(None, me, {
+                "toplam_task": len(current),
+                "atlanan": len(atlanan_listeler),
+            }, True)
         except Exception as e:
             log(f"❌ Mail Hatası: {e}")
         return
@@ -504,19 +549,21 @@ def main():
 
     log(
         f"📊 Sonuç: değişti+yorum={len(changed_with)}, "
-        f"değişti-yorum={len(changed_no)}, kaldırıldı={len(removed)}."
+        f"değişti-yorum={len(changed_no)}, kaldırıldı={len(removed)}, "
+        f"atlanan liste={len(atlanan_listeler)}."
     )
 
-    if not (changed_with or changed_no or removed):
+    if not (changed_with or changed_no or removed or atlanan_listeler):
         log("ℹ️ Bu çalıştırmada değişiklik tespit edilmedi, mail gönderilmiyor.")
         save_snapshot(current)
         return
 
-    dosya = write_excel(changed_with, changed_no, removed)
+    dosya = write_excel(changed_with, changed_no, removed, atlanan_listeler)
     summary = {
         "degisti_yorumlu": len(changed_with),
         "degisti_yorumsuz": len(changed_no),
         "kaldirildi": len(removed),
+        "atlanan": len(atlanan_listeler),
     }
     try:
         send_mail(dosya, me, summary, False)
