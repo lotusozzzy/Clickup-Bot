@@ -152,6 +152,46 @@ def sayiya_cevir(deger):
         return 0.0
 
 
+def resolve_dropdown_value(cf, default="Belirtilmemiş"):
+    """ClickUp dropdown / labels custom field'ının ham value'sunu okunabilir isme çevirir.
+
+    - drop_down: value bir integer index, gerçek ad type_config.options[index].name
+    - labels: value bir UUID listesi, her UUID type_config.options[i].id ile eşleşir
+    - başka tipler / parse edilemeyen durumlar: değeri olduğu gibi string'e çevir
+    """
+    raw = cf.get('value')
+    if raw is None or raw == "":
+        return default
+
+    type_config = cf.get('type_config') or {}
+    options = type_config.get('options') or []
+
+    # drop_down: value bir index (int veya stringe çevrilmiş int)
+    try:
+        idx = int(raw)
+        if 0 <= idx < len(options):
+            name = options[idx].get('name')
+            if name:
+                return name
+    except (ValueError, TypeError):
+        pass
+
+    # labels: value UUID listesi
+    if isinstance(raw, list) and raw:
+        names = []
+        for label_id in raw:
+            for opt in options:
+                if opt.get('id') == label_id:
+                    name = opt.get('name')
+                    if name:
+                        names.append(name)
+                    break
+        if names:
+            return ", ".join(names)
+
+    return str(raw)
+
+
 def fetch_list_tasks(session, l_id, l_name):
     """Tek bir listenin tüm tasklarını sayfa sayfa çek.
 
@@ -287,7 +327,7 @@ def verileri_cek_ve_raporla():
                         except (ValueError, TypeError):
                             pass
                     if cf_id == SIRKET_ALAN_ID and 'value' in cf:
-                        current_sirket = str(cf.get('value', "Belirtilmemiş"))
+                        current_sirket = resolve_dropdown_value(cf)
 
                 if tarih_ok:
                     for cf in custom_fields:
