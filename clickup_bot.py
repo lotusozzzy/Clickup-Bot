@@ -43,6 +43,7 @@ MILAT_TIMESTAMP = int(datetime.datetime(2024, 1, 1).timestamp() * 1000)
 
 GONDEREN_MAIL = os.environ.get("SMTP_FROM", "clickup@solarfame.com")
 ALICI_MAIL = os.environ.get("MAIL_TO", "solarframemuhasebe@solarfame.com")
+ALICI_MAIL_DAILY = os.environ.get("MAIL_TO_DAILY", "yonetim@solarfame.com")
 SMTP_SUNUCU = os.environ.get("SMTP_HOST", "smtp.yandex.com.tr")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 

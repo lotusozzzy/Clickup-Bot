@@ -31,7 +31,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from clickup_bot import (
-    ALICI_MAIL,
+    ALICI_MAIL_DAILY as ALICI_MAIL,
     BASE_SLEEP,
     GONDEREN_MAIL,
     GONDEREN_SIFRE,
