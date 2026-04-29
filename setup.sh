@@ -52,8 +52,8 @@ source "$APP_DIR/venv/bin/activate"
 pip install --upgrade pip --quiet
 pip install --quiet requests openpyxl
 
-echo "[4/7] run.sh, run_and_stop.sh ve run_daily_and_stop.sh yazılıyor..."
-# Manuel test için - kapanmaz
+echo "[4/7] run.sh, run_daily.sh, run_and_stop.sh ve run_daily_and_stop.sh yazılıyor..."
+# Manuel test / 7/24 açık sunucu cron'u için - kapanmaz (haftalık bakiye)
 cat > "$APP_DIR/run.sh" <<EOF
 #!/bin/bash
 cd "$APP_DIR"
@@ -64,7 +64,18 @@ set +a
 EOF
 chmod +x "$APP_DIR/run.sh"
 
-# Haftalık (Salı) bakiye raporu için - sonunda instance'ı kapatır
+# Manuel test / 7/24 açık sunucu cron'u için - kapanmaz (günlük tarih raporu)
+cat > "$APP_DIR/run_daily.sh" <<EOF
+#!/bin/bash
+cd "$APP_DIR"
+set -a
+source "$APP_DIR/.env"
+set +a
+"$APP_DIR/venv/bin/python" "$APP_DIR/clickup_due_report.py"
+EOF
+chmod +x "$APP_DIR/run_daily.sh"
+
+# EventBridge ile otomatik açılan/kapanan sunucu için - sonunda instance'ı durdurur
 cat > "$APP_DIR/run_and_stop.sh" <<EOF
 #!/bin/bash
 # Haftalık bakiye raporu wrapper'ı.
@@ -222,11 +233,11 @@ SUDOERS_FILE="/etc/sudoers.d/clickup-bot-shutdown"
 echo "$CURRENT_USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee "$SUDOERS_FILE" >/dev/null
 sudo chmod 440 "$SUDOERS_FILE"
 
-echo "[6/7] Cron işleri ekleniyor (haftalık + günlük)..."
-# Haftalık bakiye: Salı 09:00 TR (06:00 UTC)
-WEEKLY_LINE="0 6 * * 2 $APP_DIR/run_and_stop.sh >> $APP_DIR/cron.log 2>&1"
-# Günlük tarih değişiklik raporu: Pzt-Cum 21:00 TR (18:00 UTC)
-DAILY_LINE="0 18 * * 1-5 $APP_DIR/run_daily_and_stop.sh >> $APP_DIR/cron_daily.log 2>&1"
+echo "[6/7] Cron işleri ekleniyor (haftalık + günlük) — 7/24 açık sunucu için kapatmasız wrapper'lar..."
+# Haftalık bakiye: Salı 09:00 TR (06:00 UTC) — kapatmasız
+WEEKLY_LINE="0 6 * * 2 $APP_DIR/run.sh >> $APP_DIR/cron.log 2>&1"
+# Günlük tarih değişiklik raporu: Pzt-Cum 21:00 TR (18:00 UTC) — kapatmasız
+DAILY_LINE="0 18 * * 1-5 $APP_DIR/run_daily.sh >> $APP_DIR/cron_daily.log 2>&1"
 ( crontab -l 2>/dev/null | grep -v "$APP_DIR/run" ; echo "$WEEKLY_LINE" ; echo "$DAILY_LINE" ) | crontab -
 echo "  -> Kurulu cron satırları:"
 crontab -l 2>/dev/null | grep "$APP_DIR/run" || echo "  (cron satırı bulunamadı - lütfen 'crontab -l' ile manuel kontrol et)"
@@ -260,15 +271,17 @@ echo ""
 echo "(Foreground çalıştırma — bağlantı kopunca ölür):"
 echo "  $APP_DIR/run.sh"
 echo ""
-echo "Otomatik cron'lar (TR saati):"
-echo "  Salı 09:00            -> run_and_stop.sh         (haftalık bakiye + instance stop)"
-echo "  Pzt-Cum 21:00         -> run_daily_and_stop.sh   (günlük tarih raporu + instance stop)"
+echo "Otomatik cron'lar (TR saati) — 7/24 açık sunucu modu:"
+echo "  Salı 09:00            -> run.sh         (haftalık bakiye)"
+echo "  Pzt-Cum 21:00         -> run_daily.sh   (günlük tarih raporu)"
 echo ""
-echo "AWS EventBridge Scheduler tarafında olması gerekenler:"
-echo "  Clickup-Uyandir       -> Salı 08:50 start"
-echo "  Clickup-Uyut          -> Salı 10:00 stop (yedek)"
-echo "  Clickup-Daily-Uyandir -> Pzt-Cum 20:50 start"
-echo "  Clickup-Daily-Uyut    -> Pzt-Cum 21:30 stop (yedek)"
+echo "Eğer EventBridge ile sunucuyu otomatik açıp kapatmak istersen:"
+echo "  cron'u manuel olarak run_and_stop.sh / run_daily_and_stop.sh'e çevir"
+echo "  ve şu schedule'ları kur:"
+echo "    Clickup-Uyandir       -> Salı 08:50 start"
+echo "    Clickup-Uyut          -> Salı 10:00 stop (yedek)"
+echo "    Clickup-Daily-Uyandir -> Pzt-Cum 20:50 start"
+echo "    Clickup-Daily-Uyut    -> Pzt-Cum 21:30 stop (yedek)"
 echo ""
 echo "Logları izlemek için:"
 echo "  tail -f $APP_DIR/cron.log         (haftalık)"
