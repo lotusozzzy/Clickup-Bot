@@ -1,7 +1,7 @@
 #!/bin/bash
 # ClickUp Bot - EC2 üzerinde tek komutla kurulum.
 # Kullanım (EC2 terminalinde):
-#   curl -fsSL https://raw.githubusercontent.com/lotusozzzy/clickup-bot/claude/fix-script-freezing-issue-QME50/setup.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/lotusozzzy/clickup-bot/claude/history-based-date-attribution/setup.sh | bash
 #
 # Repo private ise indirip elle çalıştır:
 #   bash setup.sh
@@ -9,7 +9,7 @@
 set -e
 
 REPO_URL="${REPO_URL:-https://github.com/lotusozzzy/clickup-bot.git}"
-BRANCH="${BRANCH:-claude/fix-script-freezing-issue-QME50}"
+BRANCH="${BRANCH:-claude/history-based-date-attribution}"
 APP_DIR="${APP_DIR:-$HOME/clickup-bot}"
 
 echo ""

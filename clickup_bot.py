@@ -57,6 +57,12 @@ BASE_SLEEP = 0.7                  # Her istek arasında bekleme
 MAX_429_RETRIES = 6               # Tek sayfa için 429 tekrar denemesi
 LIST_WATCHDOG_SECONDS = 120       # Bir liste 120 sn içinde bitmezse atla
 
+# KEEP_EXCEL_ON_DISK=true verilirse rapor Excel'i mail gönderildikten sonra
+# silinmez; dogrulama / diff için diskte kalır. Default false.
+KEEP_EXCEL_ON_DISK = os.environ.get("KEEP_EXCEL_ON_DISK", "false").lower() in (
+    "true", "1", "yes", "on"
+)
+
 headers = {"Authorization": API_TOKEN, "Content-Type": "application/json"}
 
 
@@ -538,8 +544,10 @@ def excel_ve_mail(veriler, atlanan_listeler=None):
     except Exception as e:
         log(f"❌ Mail Hatası: {e}")
     finally:
-        if os.path.exists(dosya):
+        if not KEEP_EXCEL_ON_DISK and os.path.exists(dosya):
             os.remove(dosya)
+        elif KEEP_EXCEL_ON_DISK and os.path.exists(dosya):
+            log(f"📁 KEEP_EXCEL_ON_DISK=true → '{dosya}' diskte tutuluyor.")
 
 
 if __name__ == "__main__":
