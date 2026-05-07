@@ -279,11 +279,58 @@ def get_last_comment(session, task_id):
     }
 
 
+def get_due_date_history(session, task_id):
+    """Task'ın due_date değişiklik tarihçesini API'den çek.
+
+    ClickUp v2 task yanıtı 'history_items' alanı içerir; oradan SADECE
+    field == 'due_date' olan kayıtları alıp en yeniden eskiye sıralı döndürür.
+    Yanıtta history_items yoksa (workspace ayarına göre olabiliyor) [] döner.
+    """
+    r = safe_get(
+        session,
+        f"https://api.clickup.com/api/v2/task/{task_id}",
+        attempt_label=f"task history {task_id}",
+    )
+    if r is None or r.status_code != 200:
+        return []
+    try:
+        data = r.json()
+    except ValueError:
+        return []
+    items = data.get("history_items") or []
+    due_changes = []
+    for h in items:
+        if h.get("field") != "due_date":
+            continue
+        user = h.get("user") or {}
+        try:
+            date_ms = int(h.get("date") or 0)
+        except (ValueError, TypeError):
+            date_ms = 0
+        due_changes.append({
+            "user_id": user.get("id"),
+            "username": user.get("username", ""),
+            "date_ms": date_ms,
+        })
+    due_changes.sort(key=lambda x: x["date_ms"], reverse=True)
+    return due_changes
+
+
 def diff_snapshots(prev, curr, session, my_user_id):
-    """Üç liste döner: değişti+yorum, değişti-yorum, kaldırıldı."""
+    """Üç liste döner: değişti+yorum, değişti-yorum, kaldırıldı.
+
+    Filtre: Tarih değişikliğini gerçekten kullanıcının kendisi yapmışsa
+    (history_items'taki en yeni due_date kaydının user.id'si my_user_id ise)
+    o satır rapora hiç eklenmez. Bu kontrol yorumlardan tamamen bağımsızdır.
+
+    Eğer history_items API yanıtında gelmezse, o task için filtre
+    uygulanamaz; bu durumda satır 'tarih değiştireni belirlenemedi' olarak
+    raporlanır. Çalıştırma sonunda kaç tane böyle olduğu özetlenir.
+    """
     changed_with_comment = []
     changed_no_comment = []
     removed = []
+    history_unavailable = 0
 
     prev_tasks = (prev or {}).get("tasks", {}) or {}
 
@@ -294,54 +341,64 @@ def diff_snapshots(prev, curr, session, my_user_id):
         prev_due = _normalize_due(p.get("due_date")) if p else None
         curr_due = _normalize_due(c.get("due_date")) if c else None
 
-        # İkisinde de tarih yoksa ilgilenmiyoruz
         if not prev_due and not curr_due:
             continue
-
-        # Task şu an açık değil (kapanmış/arşivlenmiş/silinmiş) → atla
         if not c:
             continue
-
-        # Tarih kaldırıldı: önceden vardı, şimdi yok
-        if prev_due and not curr_due:
-            removed.append({
-                "task_id": tid,
-                "name": c.get("name") or (p.get("name") if p else ""),
-                "list_name": c.get("list_name", ""),
-                "space_name": c.get("space_name", ""),
-                "url": c.get("url", ""),
-                "old_date": fmt_date(prev_due),
-            })
-            continue
-
-        # Yeni eklenen tarih: kullanıcı bunları istemedi
+        # Yeni eklenen tarih raporlanmaz
         if not prev_due and curr_due:
             continue
 
-        # İkisi de var, karşılaştır
-        if str(prev_due) != str(curr_due):
-            last_comment = get_last_comment(session, tid)
-            time.sleep(BASE_SLEEP)
+        is_removed = bool(prev_due and not curr_due)
+        is_changed = bool(prev_due and curr_due and str(prev_due) != str(curr_due))
+        if not is_removed and not is_changed:
+            continue
 
-            row = {
-                "task_id": tid,
-                "name": c.get("name", ""),
-                "list_name": c.get("list_name", ""),
-                "space_name": c.get("space_name", ""),
-                "url": c.get("url", ""),
-                "old_date": fmt_date(prev_due),
-                "new_date": fmt_date(curr_due),
-                "last_comment_by": (last_comment or {}).get("username", ""),
-                "last_comment_text": (last_comment or {}).get("text", ""),
-            }
+        # Tarihi kim değiştirdi - history'den
+        history = get_due_date_history(session, tid)
+        time.sleep(BASE_SLEEP)
 
-            last_user_id = (last_comment or {}).get("user_id")
-            if last_comment and last_user_id and last_user_id != my_user_id:
-                changed_with_comment.append(row)
-            else:
-                row["last_comment_by"] = ""
-                row["last_comment_text"] = ""
-                changed_no_comment.append(row)
+        if history:
+            most_recent = history[0]
+            if most_recent.get("user_id") == my_user_id:
+                continue  # kullanıcının kendi değişikliği, raporda gösterme
+            changer_name = most_recent.get("username") or "(bilinmiyor)"
+        else:
+            history_unavailable += 1
+            changer_name = "(history yok)"
+
+        last_comment = get_last_comment(session, tid)
+        time.sleep(BASE_SLEEP)
+
+        row = {
+            "task_id": tid,
+            "name": c.get("name") or (p.get("name") if p else ""),
+            "list_name": c.get("list_name", ""),
+            "space_name": c.get("space_name", ""),
+            "url": c.get("url", ""),
+            "old_date": fmt_date(prev_due),
+            "changer": changer_name,
+            "last_comment_by": (last_comment or {}).get("username", ""),
+            "last_comment_text": (last_comment or {}).get("text", ""),
+        }
+
+        if is_removed:
+            removed.append(row)
+            continue
+
+        row["new_date"] = fmt_date(curr_due)
+        if last_comment and last_comment.get("user_id"):
+            changed_with_comment.append(row)
+        else:
+            row["last_comment_by"] = ""
+            row["last_comment_text"] = ""
+            changed_no_comment.append(row)
+
+    if history_unavailable:
+        log(
+            f"⚠️ {history_unavailable} task için history_items yanıtta yoktu; "
+            "bu satırlarda 'tarihi değiştiren' kolonu boş gelir ve filtre uygulanamaz."
+        )
 
     return changed_with_comment, changed_no_comment, removed
 
@@ -418,27 +475,32 @@ def write_excel(changed_with, changed_no, removed, atlanan_listeler=None):
     )
 
     headers_with = ["Task", "Space", "Liste", "Eski Tarih", "Yeni Tarih",
-                    "Son Yorumu Yazan", "Son Yorum", "URL"]
-    headers_no = ["Task", "Space", "Liste", "Eski Tarih", "Yeni Tarih", "URL"]
-    headers_removed = ["Task", "Space", "Liste", "Kaldırılan Tarih", "URL"]
+                    "Tarihi Değiştiren", "Son Yorumu Yazan", "Son Yorum", "URL"]
+    headers_no = ["Task", "Space", "Liste", "Eski Tarih", "Yeni Tarih",
+                  "Tarihi Değiştiren", "URL"]
+    headers_removed = ["Task", "Space", "Liste", "Kaldırılan Tarih",
+                       "Tarihi Kaldıran", "URL"]
 
     _add_sheet(
         wb, "Tarih Değişti + Yorum", headers_with,
         [[r["name"], r["space_name"], r["list_name"], r["old_date"], r["new_date"],
-          r["last_comment_by"], r["last_comment_text"], r["url"]] for r in changed_with],
+          r.get("changer", ""), r["last_comment_by"], r["last_comment_text"], r["url"]]
+         for r in changed_with],
         "Tbl_DegistiYorumlu",
         header_fill, header_font, wrap_alignment, thin_border,
     )
     _add_sheet(
         wb, "Tarih Değişti - Yorum Yok", headers_no,
-        [[r["name"], r["space_name"], r["list_name"], r["old_date"], r["new_date"], r["url"]]
+        [[r["name"], r["space_name"], r["list_name"], r["old_date"], r["new_date"],
+          r.get("changer", ""), r["url"]]
          for r in changed_no],
         "Tbl_DegistiYorumsuz",
         header_fill, header_font, wrap_alignment, thin_border,
     )
     _add_sheet(
         wb, "Tarih Kaldırıldı", headers_removed,
-        [[r["name"], r["space_name"], r["list_name"], r["old_date"], r["url"]]
+        [[r["name"], r["space_name"], r["list_name"], r["old_date"],
+          r.get("changer", ""), r["url"]]
          for r in removed],
         "Tbl_Kaldirildi",
         header_fill, header_font, wrap_alignment, thin_border,
@@ -488,16 +550,17 @@ def send_mail(dosya, me_info, summary, is_first_run):
         body = f"""
         <html><body style="font-family: Arial, sans-serif; color: #{SF_GRAY};">
           <h2 style="color: #{SF_ORANGE};">Günlük Tarih Değişikliği Raporu</h2>
-          <p>Bir önceki çalıştırmadan bu yana tespit edilen değişiklikler ekteki Excel dosyasındadır.</p>
+          <p>Bir önceki çalıştırmadan bu yana tespit edilen değişiklikler ekteki Excel dosyasındadır.
+             Tarihi gerçekten kim değiştirdiği ClickUp'ın task tarihçesinden okunur;
+             <b>{me_info.get('username', '')}</b> tarafından yapılan değişiklikler raporda yer almaz.</p>
           <ul>
-            <li><b>Tarih değişti + son yorumu başkası yazmış:</b> {summary['degisti_yorumlu']}</li>
-            <li><b>Tarih değişti - yorum yok / sadece sen yorumlamışsın:</b> {summary['degisti_yorumsuz']}</li>
+            <li><b>Tarih değişti (yorum var):</b> {summary['degisti_yorumlu']}</li>
+            <li><b>Tarih değişti (yorum yok):</b> {summary['degisti_yorumsuz']}</li>
             <li><b>Tarih kaldırıldı:</b> {summary['kaldirildi']}</li>
           </ul>
           {atlanan_uyari}
           <p style="color: #888; font-size: 12px;">
-            Çalıştıran: {me_info.get('username', '')} ({me_info.get('email', '')}) — bu kullanıcının
-            yaptığı değişikliklere ait yorumlar 2. sekmeye düşer.
+            Çalıştıran: {me_info.get('username', '')} ({me_info.get('email', '')}).
           </p>
         </body></html>
         """
