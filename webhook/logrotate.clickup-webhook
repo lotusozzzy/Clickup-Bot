@@ -1,0 +1,24 @@
+# /etc/logrotate.d/clickup-webhook
+# Faz 6: Webhook ve operasyonel scriptlerin log dosyalarını günlük rotate eder.
+#
+# copytruncate kullanılıyor: dosyayı kopyala → orijinali sıfırla. Gunicorn /
+# Python script'i append modda yazıyor, restart gerekmiyor. (rename + reopen
+# yapsaydık receiver gun gun yeni dosya açma signal'ı gerekirdi.)
+
+/home/ubuntu/clickup-bot/webhook.log
+/home/ubuntu/clickup-bot/webhook_access.log
+/home/ubuntu/clickup-bot/webhook_error.log
+/home/ubuntu/clickup-bot/health_check.log
+/home/ubuntu/clickup-bot/sub_monitor.log
+/home/ubuntu/clickup-bot/db_cleanup.log
+{
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su ubuntu ubuntu
+    create 0644 ubuntu ubuntu
+}
