@@ -60,3 +60,53 @@ def get_connection(db_path=None):
         conn.commit()
     finally:
         conn.close()
+
+
+# SQLite parametre limiti (varsayılan 999, defansif olarak 500 kullan)
+_BATCH_SIZE = 500
+
+
+def get_due_date_events_batch(task_ids, since_ms, db_path=None):
+    """Bir grup task için 'due_date' değişikliği event'lerini topluca çek.
+
+    Parametreler:
+        task_ids: iterable (list/set/tuple) - sorgulanacak task ID'leri
+        since_ms: int     - bu epoch_ms değerinden SONRAKİ event'ler döner
+                            (snapshot saved_at ms cinsinden ekran)
+
+    Dönüş:
+        {task_id: [event_dict, ...]}  — her task için en yeni event en başta.
+        İstenen task_id'lerden hiç event olmayanlar boş liste ile gelir.
+
+    Tek bir IN clause yerine 500'lü chunk'lar halinde sorgular
+    (SQLITE_MAX_VARIABLE_NUMBER limitine yaklaşmamak için).
+    """
+    task_ids = [tid for tid in task_ids if tid]
+    by_task = {tid: [] for tid in task_ids}
+    if not task_ids:
+        return by_task
+
+    sql_template = """
+        SELECT task_id, user_id, user_name, before_value, after_value, changed_at_ms
+        FROM events
+        WHERE field = 'due_date'
+          AND changed_at_ms > ?
+          AND task_id IN ({placeholders})
+        ORDER BY changed_at_ms DESC
+    """
+    with get_connection(db_path) as conn:
+        for i in range(0, len(task_ids), _BATCH_SIZE):
+            chunk = task_ids[i : i + _BATCH_SIZE]
+            placeholders = ",".join(["?"] * len(chunk))
+            sql = sql_template.format(placeholders=placeholders)
+            params = [since_ms] + chunk
+            for row in conn.execute(sql, params):
+                tid = row[0]
+                by_task[tid].append({
+                    "user_id": row[1],
+                    "user_name": row[2] or "",
+                    "before_value": row[3],
+                    "after_value": row[4],
+                    "changed_at_ms": row[5],
+                })
+    return by_task

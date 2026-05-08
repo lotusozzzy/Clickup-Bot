@@ -2,9 +2,25 @@
 
 Cariler haricindeki tüm Space'lerdeki AÇIK task'lar üzerinde:
   - Bir önceki snapshot'a göre due_date değişen task'ları bulur.
-  - "Değişti + son yorumu yazan SEN değilsin" → Sekme 1
-  - "Değişti + hiç yorum yok ya da son yorumu sen yazmışsın" → Sekme 2
+  - "Değişti + yorum var" → Sekme 1
+  - "Değişti + yorum yok" → Sekme 2
   - "Önceden tarih vardı, şu an yok" (tarih kaldırıldı) → Sekme 3
+
+ATIF KAYNAĞI (Faz 5'ten itibaren): webhook event store
+(webhook_events.db). ClickUp'a abone olduğumuz webhook 'taskUpdated'
+event'leri receiver tarafından SQLite'a yazılıyor. Daily report,
+snapshot diff'inde değişen her task için bu DB'ye sorgu atıp
+"snapshot saved_at'ten beri olan due_date event'lerini" çekiyor.
+
+  - Tüm event'ler kullanıcının kendisinden ise           → atla (filtered_self_only)
+  - En az bir non-self event varsa                       → verified, en yeni non-self göster
+  - Bu pencerede hiç event yoksa                         → no_events; bağlam için
+                                                            date_updated yakını yorumu
+                                                            'Olası Değiştiren (yorum)'
+                                                            kolonuna düşer (filtre değil)
+
+Yorumlar SADECE bağlam: 'Son Yorumu Yazan' / 'Son Yorum'.
+Filtreleme kararına etki etmez.
 
 İlk çalıştırmada karşılaştıracak veri olmadığı için sadece snapshot
 kaydedilir ve bilgi maili atılır.
@@ -49,6 +65,8 @@ from clickup_bot import (
     log,
     safe_get,
 )
+
+from webhook.db import get_due_date_events_batch
 
 EXCLUDE_SPACE = "Cariler"
 SNAPSHOT_FILE = os.path.join(
@@ -256,27 +274,10 @@ def fetch_task(session, task_id):
         return None
 
 
-def extract_due_date_history(task_data):
-    """Task JSON'undan SADECE due_date değişikliklerini en yeniden eskiye sırala."""
-    if not task_data:
-        return []
-    items = task_data.get("history_items") or []
-    out = []
-    for h in items:
-        if h.get("field") != "due_date":
-            continue
-        user = h.get("user") or {}
-        try:
-            date_ms = int(h.get("date") or 0)
-        except (ValueError, TypeError):
-            date_ms = 0
-        out.append({
-            "user_id": user.get("id"),
-            "username": user.get("username", ""),
-            "date_ms": date_ms,
-        })
-    out.sort(key=lambda x: x["date_ms"], reverse=True)
-    return out
+# NOT: history_items tabanlı eski extract_due_date_history() fonksiyonu Faz 5'te
+# kaldırıldı. ClickUp v2 GET /task/{id} yanıtı history_items'ı public olarak
+# döndürmüyor (missing=100% gözlemlendi). Yerine webhook event store'u
+# (webhook_events.db) kullanılıyor — webhook.db.get_due_date_events_batch.
 
 
 def fetch_all_comments(session, task_id):
@@ -353,67 +354,87 @@ def _snapshot_saved_at_ms(prev):
         return None
 
 
-def _attribute_change(history, my_user_id, snapshot_taken_ms):
-    """Bir tarih değişikliğini atfeder.
+def _is_my_user(event_user_id, my_user_id):
+    """Event user_id ile API user_id eşleşir mi (str/int normalize)."""
+    if event_user_id is None or my_user_id is None:
+        return False
+    return str(event_user_id) == str(my_user_id)
+
+
+def _attribute_change(events, my_user_id):
+    """Bir tarih değişikliğini, webhook event'lerine bakarak atfeder.
+
+    events: [{user_id, user_name, before_value, after_value, changed_at_ms}, ...]
+            en yeni en başta sıralı; SADECE snapshot penceresi içindeki kayıtlar.
+            (Pencere filtresi get_due_date_events_batch'in 'since_ms' parametresinde
+            zaten uygulandı — burada tekrar filtrelemiyoruz.)
 
     Returns:
-        skip (bool):     True ise satır rapordan çıkarılır (sadece kullanıcı yapmış)
-        changer_name:    'Tarihi Değiştiren' kolonu için (None ise dolduran tarafça doldurulur)
-        quality (str):   metrik için kalite etiketi
-            'verified'   → snapshot penceresinde başkası bulundu
-            'self_only'  → snapshot penceresinde sadece kullanıcı (skip=True)
-            'incomplete' → snapshot var ama pencerede hiç kayıt yok (anomali)
-            'fallback'   → snapshot zamanı yok, en yeni overall'a düştük
-            'missing'    → history hiç yok
+        skip (bool):    True ise satır rapordan çıkarılır
+        changer_name:   'Tarihi Değiştiren' kolonu için
+        changer_id:     atıf doğrulamak isteyen consumer için
+        quality (str):
+            'verified'  → en az bir non-self event var, atıf yapıldı
+            'self_only' → tüm event'ler kullanıcının kendisinden (skip=True)
+            'no_events' → bu task için pencerede hiç event yok
+                          (subscribe öncesi değişiklik veya event kaybı)
     """
-    if not history:
-        return (False, None, "missing")
+    if not events:
+        return {
+            "skip": False,
+            "changer_name": None,
+            "changer_id": None,
+            "quality": "no_events",
+        }
 
-    if snapshot_taken_ms is not None:
-        period = [h for h in history if h["date_ms"] > snapshot_taken_ms]
-        others = [h for h in period if h["user_id"] != my_user_id]
+    non_mine = [e for e in events if not _is_my_user(e["user_id"], my_user_id)]
 
-        if not period:
-            # Diff var ama pencerede history yok → anomali
-            return (False, None, "incomplete")
+    if not non_mine:
+        return {
+            "skip": True,
+            "changer_name": None,
+            "changer_id": None,
+            "quality": "self_only",
+        }
 
-        if not others:
-            # Pencerede sadece ben → atla
-            return (True, None, "self_only")
-
-        return (False, others[0]["username"] or "(bilinmiyor)", "verified")
-
-    # Snapshot zamanı yok → en yeni overall fallback
-    most_recent = history[0]
-    if most_recent["user_id"] == my_user_id:
-        return (True, None, "fallback")
-    return (False, most_recent["username"] or "(bilinmiyor)", "fallback")
+    most_recent_other = non_mine[0]  # events zaten DESC sıralı
+    return {
+        "skip": False,
+        "changer_name": most_recent_other["user_name"] or "(bilinmiyor)",
+        "changer_id": most_recent_other["user_id"],
+        "quality": "verified",
+    }
 
 
 def diff_snapshots(prev, curr, session, my_user_id):
     """Üç liste + metrik dict döner.
 
-    Filtre: Tarih değişikliğini SADECE kullanıcı yapmışsa (snapshot
-    penceresinde history'deki tüm due_date kayıtlarının user.id'si
-    my_user_id ile eşleşiyorsa) o satır rapordan çıkarılır. Yorumlar
-    filtreleme kararına etki etmez; sadece bağlam için gösterilir.
+    Filtre: Tarih değişikliğini SADECE kullanıcı yapmışsa (webhook
+    event store'unda snapshot penceresindeki tüm due_date event'lerinin
+    user_id'si my_user_id ile eşleşiyorsa) o satır rapordan çıkarılır.
+    Yorumlar filtreleme kararına etki etmez; sadece bağlam için gösterilir.
+
+    Atıf kaynağı: webhook_events.db (Faz 2-4 ile kurulan event store).
+    history_items API kanalı public değildi, kaldırıldı.
     """
     changed_with_comment = []
     changed_no_comment = []
     removed = []
 
     metrics = {
-        "total_diff": 0,         # diff yakalanan toplam task
-        "filtered_mine": 0,      # ben yaptığım için atlanan
-        "verified": 0,           # snapshot penceresinde başkası bulundu
-        "fallback": 0,           # snapshot zamanı yok, overall kullanıldı
-        "incomplete": 0,         # pencerede history yok (anomali)
-        "missing": 0,            # history hiç yok
+        "total_diff": 0,            # snapshot diff'inde tarih değişen toplam task
+        "filtered_self_only": 0,    # kullanıcının kendi yaptığı için atlanan
+        "verified": 0,              # webhook event'lerinden başkası bulundu
+        "no_events": 0,             # pencerede webhook event'i yok
     }
 
     prev_tasks = (prev or {}).get("tasks", {}) or {}
     snapshot_taken_ms = _snapshot_saved_at_ms(prev)
+    if snapshot_taken_ms is None:
+        log("⚠️ snapshot.saved_at parse edilemedi - tüm satırlar 'no_events' olarak işlenecek.")
 
+    # 1. Tüm diff'leri topla (henüz event sorgulamadan)
+    diffs = []  # liste: (tid, p, c, prev_due, curr_due, is_removed)
     all_ids = set(prev_tasks.keys()) | set(curr.keys())
     for tid in all_ids:
         p = prev_tasks.get(tid)
@@ -433,24 +454,29 @@ def diff_snapshots(prev, curr, session, my_user_id):
         if not is_removed and not is_changed:
             continue
 
+        diffs.append((tid, p, c, prev_due, curr_due, is_removed))
         metrics["total_diff"] += 1
 
-        # Task'ı tek seferde çek (history + date_updated bir arada)
-        task_data = fetch_task(session, tid)
-        time.sleep(BASE_SLEEP)
-        history = extract_due_date_history(task_data)
-
-        skip, changer_name, quality = _attribute_change(
-            history, my_user_id, snapshot_taken_ms
+    # 2. Tek SQLite çağrısıyla tüm değişen task'lar için event'leri çek
+    if snapshot_taken_ms is not None and diffs:
+        events_by_task = get_due_date_events_batch(
+            [d[0] for d in diffs], snapshot_taken_ms
         )
+    else:
+        events_by_task = {}
 
-        if skip:
-            metrics["filtered_mine"] += 1
+    # 3. Her diff için atıf yap, gerekirse yorum/comment fallback fetch
+    for tid, p, c, prev_due, curr_due, is_removed in diffs:
+        events = events_by_task.get(tid, [])
+        attr = _attribute_change(events, my_user_id)
+
+        if attr["skip"]:
+            metrics["filtered_self_only"] += 1
             continue
 
-        metrics[quality] += 1
+        metrics[attr["quality"]] += 1
 
-        # Yorumları çek (tek defa, hem son yorum hem fallback için)
+        # Bağlam için yorumlar (her zaman çekilir; rate-limit'e dikkat)
         comments = fetch_all_comments(session, tid)
         time.sleep(BASE_SLEEP)
 
@@ -462,20 +488,27 @@ def diff_snapshots(prev, curr, session, my_user_id):
             last_comment_by = user.get("username", "")
             last_comment_text = _extract_comment_text(last_c)
 
-        # Fallback bağlam: history yok/eksikse date_updated yakını yorumu sahibini al
+        # Fallback: webhook event yoksa, date_updated'a yakın yorumu tahmini değiştiren olarak göster
         yorum_tahmin = ""
-        if quality in ("missing", "incomplete") and task_data:
-            try:
-                date_updated_ms = int(task_data.get("date_updated") or 0)
-            except (ValueError, TypeError):
-                date_updated_ms = 0
-            if date_updated_ms:
-                near = _comment_near_date(comments, date_updated_ms)
-                if near:
-                    near_user = near.get("user") or {}
-                    yorum_tahmin = near_user.get("username") or ""
+        if attr["quality"] == "no_events":
+            task_data = fetch_task(session, tid)
+            time.sleep(BASE_SLEEP)
+            if task_data:
+                try:
+                    date_updated_ms = int(task_data.get("date_updated") or 0)
+                except (ValueError, TypeError):
+                    date_updated_ms = 0
+                if date_updated_ms:
+                    near = _comment_near_date(comments, date_updated_ms)
+                    if near:
+                        near_user = near.get("user") or {}
+                        yorum_tahmin = near_user.get("username") or ""
 
-        display_changer = changer_name if changer_name else "(history yok)"
+        display_changer = (
+            attr["changer_name"]
+            if attr["changer_name"]
+            else "(webhook event yok)"
+        )
 
         row = {
             "task_id": tid,
@@ -502,18 +535,18 @@ def diff_snapshots(prev, curr, session, my_user_id):
             row["last_comment_text"] = ""
             changed_no_comment.append(row)
 
-    in_report = metrics["total_diff"] - metrics["filtered_mine"]
-    uncovered = metrics["incomplete"] + metrics["missing"]
-    coverage_pct = (
-        (metrics["verified"] + metrics["fallback"]) / max(in_report, 1) * 100
+    in_report = metrics["total_diff"] - metrics["filtered_self_only"]
+    no_events_pct = (
+        metrics["no_events"] / max(in_report, 1) * 100 if in_report > 0 else 0
     )
-    uncovered_pct = uncovered / max(in_report, 1) * 100
+    verified_pct = (
+        metrics["verified"] / max(in_report, 1) * 100 if in_report > 0 else 0
+    )
     log(
         f"📊 Atıf metrikleri: total_diff={metrics['total_diff']}, "
-        f"filtered_mine={metrics['filtered_mine']}, in_report={in_report}, "
-        f"verified={metrics['verified']}, fallback={metrics['fallback']}, "
-        f"incomplete={metrics['incomplete']}, missing={metrics['missing']} "
-        f"({coverage_pct:.0f}% atıflandı, {uncovered_pct:.0f}% atıflanamadı)"
+        f"filtered_self_only={metrics['filtered_self_only']}, "
+        f"in_report={in_report}, verified={metrics['verified']} ({verified_pct:.0f}%), "
+        f"no_events={metrics['no_events']} ({no_events_pct:.0f}%)"
     )
 
     return changed_with_comment, changed_no_comment, removed, metrics
@@ -665,35 +698,37 @@ def send_mail(dosya, me_info, summary, is_first_run):
         </body></html>
         """
     else:
-        # Atıf güvenilirliği uyarısı (>%10 atıflanamadıysa)
+        # Atıf güvenilirliği uyarısı: webhook event store'unda kayıt bulamadığımız oran %10+ ise
         atif_uyarisi = ""
         m = summary.get("metrics") or {}
-        in_report = m.get("total_diff", 0) - m.get("filtered_mine", 0)
-        uncovered = m.get("incomplete", 0) + m.get("missing", 0)
+        in_report = m.get("total_diff", 0) - m.get("filtered_self_only", 0)
+        no_events = m.get("no_events", 0)
         if in_report > 0:
-            uncovered_pct = uncovered / in_report * 100
-            if uncovered_pct > 10:
+            no_events_pct = no_events / in_report * 100
+            if no_events_pct > 10:
                 atif_uyarisi = (
                     f'<p style="background:#fff3cd; padding:12px; '
                     f'border-left:4px solid #ffa500;">'
                     f'<b>⚠️ Atıf güvenilirliği uyarısı:</b> Bu raporda {in_report} '
-                    f'satırın {uncovered} tanesi ({uncovered_pct:.0f}%) için ClickUp '
-                    f'history_items dönmedi. Bu satırlarda "Tarihi Değiştiren" '
-                    f'<i>(history yok)</i> görünür ve atıf doğrulanamadı — '
-                    f'kullanıcının kendi değişikliği olabilir.</p>'
+                    f'satırın {no_events} tanesi ({no_events_pct:.0f}%) için '
+                    f'webhook event\'i yok. Bu satırlarda "Tarihi Değiştiren" '
+                    f'<i>(webhook event yok)</i> görünür — webhook subscribe öncesi '
+                    f'yapılmış değişiklikler veya event kaybı olabilir. Zaman geçtikçe '
+                    f'bu oran düşer.</p>'
                 )
 
         baglamno_tu = (
             '<p style="color:#888;font-size:12px;font-style:italic;">'
-            'Yorum kolonları sadece bağlam içindir, filtreleme tamamen task '
-            'tarihçesi (history_items) ile yapılır.</p>'
+            'Atıf bilgileri webhook receiver tarafından gerçek zamanlı yakalanan '
+            'event\'lerden alınır. Yorum kolonları sadece bağlam içindir; '
+            'filtreleme tamamen webhook event store\'u ile yapılır.</p>'
         )
         body = f"""
         <html><body style="font-family: Arial, sans-serif; color: #{SF_GRAY};">
           <h2 style="color: #{SF_ORANGE};">Günlük Tarih Değişikliği Raporu</h2>
           {atif_uyarisi}
           <p>Bir önceki çalıştırmadan bu yana tespit edilen değişiklikler ekteki Excel dosyasındadır.
-             Tarihi gerçekten kim değiştirdiği ClickUp'ın task tarihçesinden okunur;
+             Tarihi kim değiştirdiği webhook event store'undan okunur;
              <b>{me_info.get('username', '')}</b> tarafından yapılan değişiklikler raporda yer almaz.</p>
           <ul>
             <li><b>Tarih değişti (yorum var):</b> {summary['degisti_yorumlu']}</li>
@@ -704,9 +739,10 @@ def send_mail(dosya, me_info, summary, is_first_run):
           {baglamno_tu}
           <p style="color: #888; font-size: 12px;">
             Çalıştıran: {me_info.get('username', '')} ({me_info.get('email', '')}).
-            Atıf metrikleri: verified={m.get('verified', 0)}, fallback={m.get('fallback', 0)},
-            incomplete={m.get('incomplete', 0)}, missing={m.get('missing', 0)},
-            filtered_mine={m.get('filtered_mine', 0)}.
+            Atıf metrikleri: verified={m.get('verified', 0)},
+            no_events={m.get('no_events', 0)},
+            filtered_self_only={m.get('filtered_self_only', 0)},
+            total_diff={m.get('total_diff', 0)}.
           </p>
         </body></html>
         """
@@ -737,7 +773,7 @@ def main():
     log(
         f"👤 '{me['username']}' ({me['email']}) olarak çalışılıyor — "
         f"bu kullanıcının yaptığı tarih değişiklikleri rapora eklenmez "
-        f"(history_items üzerinden doğrulanır)."
+        f"(webhook event store üzerinden doğrulanır)."
     )
 
     log("📸 Güncel snapshot alınıyor...")
@@ -756,7 +792,7 @@ def main():
             log(f"❌ Mail Hatası: {e}")
         return
 
-    log("🔍 Değişiklikler hesaplanıyor (değişen task'lar için history + yorum çekiliyor)...")
+    log("🔍 Değişiklikler hesaplanıyor (webhook event store + yorum bağlamı)...")
     changed_with, changed_no, removed, metrics = diff_snapshots(
         prev, current, session, me["id"]
     )
