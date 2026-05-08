@@ -8,3 +8,11 @@ venv/
 due_date_snapshot.json
 cron.log
 cron_daily.log
+manual.log
+manual_daily.log
+webhook.log
+webhook_events.db
+webhook_events.db-journal
+webhook_events.db-wal
+webhook_events.db-shm
+backups/
