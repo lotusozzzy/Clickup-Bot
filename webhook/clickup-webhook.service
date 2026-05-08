@@ -1,0 +1,30 @@
+[Unit]
+Description=ClickUp Webhook Receiver (gunicorn)
+Documentation=https://github.com/lotusozzzy/Clickup-Bot
+After=network.target nginx.service
+Wants=nginx.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/clickup-bot
+EnvironmentFile=/home/ubuntu/clickup-bot/.env
+ExecStart=/home/ubuntu/clickup-bot/venv/bin/gunicorn \
+  --bind 127.0.0.1:8080 \
+  --workers 2 \
+  --timeout 30 \
+  --access-logfile /home/ubuntu/clickup-bot/webhook_access.log \
+  --error-logfile /home/ubuntu/clickup-bot/webhook_error.log \
+  webhook.receiver:app
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Hardening (yumuşak; receiver ~/clickup-bot/ altında dosya yazıyor)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
