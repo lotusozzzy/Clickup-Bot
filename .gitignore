@@ -11,8 +11,11 @@ cron_daily.log
 manual.log
 manual_daily.log
 webhook.log
+webhook_access.log
+webhook_error.log
 webhook_events.db
 webhook_events.db-journal
 webhook_events.db-wal
 webhook_events.db-shm
+webhook/subscribe_response.json
 backups/
