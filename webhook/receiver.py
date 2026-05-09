@@ -145,6 +145,106 @@ def extract_changes(payload, task_id):
     return out
 
 
+def _event_type(payload):
+    """Payload'daki event type string'ini lowercase normalize et.
+
+    ClickUp top-level 'event' alanı genelde 'taskUpdated', 'taskDeleted'
+    gibi camelCase. Defansif olarak 'eventType' variantına da bak.
+    """
+    value = payload.get("event") or payload.get("eventType") or ""
+    return str(value).strip().lower()
+
+
+def _is_task_deleted_event(payload):
+    return _event_type(payload) == "taskdeleted"
+
+
+def _extract_top_level_user(payload):
+    """Payload top-level 'user'/'userInfo' alanından best-effort kullanıcı.
+
+    Adım 1: raw save için yeterli. history_items içine girmiyoruz —
+    gerçek taskDeleted payload'ı (Adım 3) görülmeden parse yazılmıyor.
+    Adım 4'te yapılandırılmış parser eklenecek.
+    """
+    user = payload.get("user") or payload.get("userInfo") or {}
+    if not isinstance(user, dict):
+        return None, None
+    user_id = user.get("id")
+    user_name = (
+        user.get("username")
+        or user.get("name")
+        or user.get("email")
+        or None
+    )
+    return (
+        str(user_id) if user_id else None,
+        user_name or None,
+    )
+
+
+def _build_deleted_event_id(payload, task_id, received_at_ms):
+    """taskDeleted için event_id türet (idempotent retry'da çakışmaması için).
+
+    Birincil: payload'daki id/event_id/eventId. Yoksa
+    'deleted-{task_id}-{received_at_ms}' — aynı silme event'i ms cinsinden
+    aynı zamanda iki kez ulaşırsa çakışır, bu kabul edilebilir bir trade-off.
+    """
+    eid = (
+        payload.get("event_id")
+        or payload.get("eventId")
+        or payload.get("id")
+    )
+    if eid:
+        return f"deleted-{eid}"
+    return f"deleted-{task_id or 'unknown'}-{received_at_ms}"
+
+
+def _ingest_deleted_raw(payload, task_id, raw_payload_str, received_at_ms):
+    """taskDeleted event'ini field='__deleted_raw__' ile DB'ye yaz.
+
+    Parse YOK — sadece raw payload saklanır. Adım 4'te gerçek payload'a
+    göre parser eklenip __deleted_raw__ kayıtları __deleted__ olarak
+    yeniden işlenebilir.
+    """
+    user_id, user_name = _extract_top_level_user(payload)
+    event_id = _build_deleted_event_id(payload, task_id, received_at_ms)
+
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO events (
+                    event_id, task_id, field, before_value, after_value,
+                    user_id, user_name, changed_at_ms, raw_payload, received_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    task_id or "",
+                    "__deleted_raw__",
+                    None,
+                    None,
+                    user_id,
+                    user_name,
+                    received_at_ms,
+                    raw_payload_str,
+                    received_at_ms,
+                ),
+            )
+            if cur.rowcount > 0:
+                log.info(
+                    "Ingested taskDeleted (raw): task=%s user=%s event_id=%s",
+                    task_id or "?",
+                    user_name or user_id or "?",
+                    event_id,
+                )
+                return jsonify({"ok": True, "ingested": 1, "kind": "deleted_raw"}), 200
+            return jsonify({"ok": True, "ingested": 0, "kind": "deleted_raw_dup"}), 200
+    except Exception as e:  # noqa: BLE001
+        log.error("DB write failed (deleted_raw): %s", e, exc_info=True)
+        return jsonify({"error": "db error"}), 500
+
+
 @app.route("/clickup-webhook", methods=["POST"])
 def clickup_webhook():
     raw = request.get_data() or b""
@@ -172,6 +272,12 @@ def clickup_webhook():
     )
     raw_payload_str = raw.decode("utf-8", errors="replace")
     received_at_ms = int(time.time() * 1000)
+
+    # taskDeleted: raw save (Adım 1). Parse mantığı Adım 4'te eklenecek.
+    if _is_task_deleted_event(payload):
+        return _ingest_deleted_raw(
+            payload, task_id, raw_payload_str, received_at_ms
+        )
 
     changes = extract_changes(payload, task_id)
 
