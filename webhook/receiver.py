@@ -27,8 +27,10 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 
+import requests
 from flask import Flask, jsonify, request
 
 from webhook.db import get_connection, init_db
@@ -37,6 +39,21 @@ from webhook.logger import get_logger
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 WEBHOOK_STATS_TOKEN = os.environ.get("WEBHOOK_STATS_TOKEN", "")
+
+# Snapshot zenginleştirme — taskDeleted event geldiğinde son snapshot'tan
+# task_name/list/space/due_date/assignees alınıyor. Daily report (clickup_due_report.py)
+# bu dosyayı atomic write+rename ile güncelliyor; receiver mtime'a bakarak
+# 10 MB+ dosyayı her event'te yeniden parse etmiyor.
+SNAPSHOT_PATH = os.environ.get(
+    "WEBHOOK_SNAPSHOT_PATH",
+    os.path.expanduser("~/clickup-bot/due_date_snapshot.json"),
+)
+COMMENT_FETCH_TIMEOUT_S = float(
+    os.environ.get("WEBHOOK_COMMENT_FETCH_TIMEOUT", "3")
+)
+
+_snapshot_lock = threading.Lock()
+_snapshot_cache = {"mtime_ns": None, "data": None}
 
 # ClickUp dokümantasyonuna göre asıl header. Diğerleri savunma amaçlı.
 _SIGNATURE_HEADERS = ("X-Signature", "X-Signature-256", "X-Hub-Signature-256")
@@ -245,6 +262,189 @@ def _ingest_deleted_raw(payload, task_id, raw_payload_str, received_at_ms):
         return jsonify({"error": "db error"}), 500
 
 
+def _load_snapshot_cached(path=None):
+    """Snapshot.json'ı in-memory cache'le; mtime değiştiyse yeniden parse.
+
+    Daily report dosyayı atomic rename ile yazıyor (clickup_due_report.save_snapshot)
+    — yarım/corrupt JSON ihtimali yok. Cache key olarak st_mtime_ns kullanıyoruz;
+    aynı mtime'da yeniden parse etmiyoruz, dolayısıyla 10 MB JSON event başına
+    bir kez okunmuş oluyor (snapshot günde 1 kez yenileniyor).
+    """
+    p = path or SNAPSHOT_PATH
+    try:
+        st = os.stat(p)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        log.warning("Snapshot stat failed (%s): %s", p, e)
+        return None
+
+    mtime_ns = st.st_mtime_ns
+    with _snapshot_lock:
+        if (
+            _snapshot_cache["mtime_ns"] == mtime_ns
+            and _snapshot_cache["data"] is not None
+        ):
+            return _snapshot_cache["data"]
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (IOError, ValueError) as e:
+            log.warning("Snapshot read failed (%s): %s", p, e)
+            return None
+        _snapshot_cache["mtime_ns"] = mtime_ns
+        _snapshot_cache["data"] = data
+        log.info(
+            "Snapshot reloaded: tasks=%d saved_at=%s",
+            len(data.get("tasks") or {}),
+            data.get("saved_at", "?"),
+        )
+        return data
+
+
+def _snapshot_lookup(task_id, snapshot_data):
+    """Snapshot'tan task için zenginleştirme alanlarını çek.
+
+    Dönüş: dict (task_name, list_name, space_name, last_due_date, assignees)
+    veya None — task_id snapshot'ta yoksa.
+    """
+    if not snapshot_data or not task_id:
+        return None
+    tasks = snapshot_data.get("tasks") or {}
+    task = tasks.get(task_id)
+    if not task:
+        return None
+    return {
+        "task_name": task.get("name") or "",
+        "list_name": task.get("list_name") or "",
+        "space_name": task.get("space_name") or "",
+        "last_due_date": task.get("due_date"),
+        "assignees": list(task.get("assignees") or []),
+    }
+
+
+def _try_fetch_last_comment(task_id, timeout=None):
+    """Best-effort: silinen task'ın son yorumunu dene.
+
+    Silinmiş task /comment endpoint'i tipik olarak 404 (ITEM_013) — beklenen
+    davranış, info olarak loglanır. Network/parse hatasında da None döner.
+    Receiver hızlı kalsın diye timeout default 3 sn (env override edilebilir).
+    """
+    if not task_id:
+        return None, None
+    token = os.environ.get("CLICKUP_API_TOKEN")
+    if not token:
+        return None, None
+
+    effective_timeout = (
+        timeout if timeout is not None else COMMENT_FETCH_TIMEOUT_S
+    )
+    try:
+        r = requests.get(
+            f"https://api.clickup.com/api/v2/task/{task_id}/comment",
+            headers={"Authorization": token},
+            timeout=effective_timeout,
+        )
+    except requests.RequestException as e:
+        log.info("Comment fetch error task=%s: %s", task_id, e)
+        return None, None
+
+    if r.status_code == 404:
+        log.info("Comment fetch 404 (task gone): %s", task_id)
+        return None, None
+    if r.status_code != 200:
+        log.info("Comment fetch HTTP %d task=%s", r.status_code, task_id)
+        return None, None
+
+    try:
+        comments = (r.json() or {}).get("comments") or []
+    except ValueError:
+        return None, None
+    if not comments:
+        return None, None
+
+    try:
+        comments.sort(key=lambda c: int(c.get("date") or 0), reverse=True)
+    except (TypeError, ValueError):
+        pass
+
+    latest = comments[0]
+    user = latest.get("user") or {}
+    author = user.get("username") or user.get("email") or None
+    text = latest.get("comment_text")
+    if not text:
+        parts = latest.get("comment") or []
+        text = "".join(
+            p.get("text", "") for p in parts if isinstance(p, dict)
+        )
+    return author, (text or None)
+
+
+def _ingest_deleted(payload, task_id, raw_payload_str, received_at_ms):
+    """taskDeleted'ı snapshot zenginleştirmesi ile DB'ye yaz.
+
+    Snapshot'ta task yoksa veya snapshot dosyası yoksa: __deleted_raw__
+    fallback'i (Adım 1 davranışı korunur). Daily report her iki field'ı da
+    okuduğu için bu graceful — eski payload'lar kayıp gitmez.
+    """
+    snapshot_data = _load_snapshot_cached()
+    enriched = _snapshot_lookup(task_id, snapshot_data)
+
+    if enriched is None:
+        log.info(
+            "taskDeleted snapshot miss task=%s — fallback to __deleted_raw__",
+            task_id or "?",
+        )
+        return _ingest_deleted_raw(
+            payload, task_id, raw_payload_str, received_at_ms
+        )
+
+    last_comment_author, last_comment_text = _try_fetch_last_comment(task_id)
+    enriched["last_comment_author"] = last_comment_author
+    enriched["last_comment_text"] = last_comment_text
+
+    user_id, user_name = _extract_top_level_user(payload)
+    event_id = _build_deleted_event_id(payload, task_id, received_at_ms)
+    before_json = json.dumps(enriched, ensure_ascii=False)
+
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO events (
+                    event_id, task_id, field, before_value, after_value,
+                    user_id, user_name, changed_at_ms, raw_payload, received_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    task_id or "",
+                    "__deleted__",
+                    before_json,
+                    None,
+                    user_id,
+                    user_name,
+                    received_at_ms,
+                    raw_payload_str,
+                    received_at_ms,
+                ),
+            )
+            if cur.rowcount > 0:
+                log.info(
+                    "Ingested taskDeleted: task=%s name=%r list=%r assignees=%d comment=%s",
+                    task_id,
+                    enriched["task_name"][:40],
+                    enriched["list_name"],
+                    len(enriched["assignees"]),
+                    "yes" if last_comment_author else "no",
+                )
+                return jsonify({"ok": True, "ingested": 1, "kind": "deleted"}), 200
+            return jsonify({"ok": True, "ingested": 0, "kind": "deleted_dup"}), 200
+    except Exception as e:  # noqa: BLE001
+        log.error("DB write failed (deleted): %s", e, exc_info=True)
+        return jsonify({"error": "db error"}), 500
+
+
 @app.route("/clickup-webhook", methods=["POST"])
 def clickup_webhook():
     raw = request.get_data() or b""
@@ -273,9 +473,10 @@ def clickup_webhook():
     raw_payload_str = raw.decode("utf-8", errors="replace")
     received_at_ms = int(time.time() * 1000)
 
-    # taskDeleted: raw save (Adım 1). Parse mantığı Adım 4'te eklenecek.
+    # taskDeleted: snapshot zenginleştirmesi + best-effort comment fetch.
+    # Snapshot miss durumunda __deleted_raw__ fallback'ine düşer (Adım 1 davranışı).
     if _is_task_deleted_event(payload):
-        return _ingest_deleted_raw(
+        return _ingest_deleted(
             payload, task_id, raw_payload_str, received_at_ms
         )
 

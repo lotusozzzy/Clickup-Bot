@@ -226,12 +226,22 @@ def build_current_snapshot(session):
                 tid = t.get("id")
                 if not tid:
                     continue
+                # Assignees task objesinde zaten geliyor — ek API çağrısı yok.
+                # Silinen task'ı raporlarken "kim atanmıştı" bağlamı için saklanır.
+                assignees = []
+                for a in (t.get("assignees") or []):
+                    if not isinstance(a, dict):
+                        continue
+                    name = a.get("username") or a.get("email") or ""
+                    if name:
+                        assignees.append(name)
                 snapshot[tid] = {
                     "due_date": _normalize_due(t.get("due_date")),
                     "name": t.get("name", ""),
                     "url": t.get("url", ""),
                     "list_name": l["name"],
                     "space_name": space_name,
+                    "assignees": assignees,
                 }
     gecen = int(time.time() - baslangic)
     log(f"✓ Tarama bitti: {len(snapshot)} açık task, {gecen}s, "
@@ -251,12 +261,22 @@ def load_previous_snapshot():
 
 
 def save_snapshot(snapshot):
+    """Snapshot'ı atomik write+rename ile yaz.
+
+    Webhook receiver bu dosyayı taskDeleted event'lerinde okuyor — yazma
+    sırasında corrupt JSON ile karşılaşmasın diye .tmp'e yaz, fsync,
+    sonra os.replace() (atomic rename, POSIX + Windows).
+    """
     payload = {
         "saved_at": datetime.datetime.now().isoformat(),
         "tasks": snapshot,
     }
-    with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+    tmp_path = SNAPSHOT_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, SNAPSHOT_FILE)
 
 
 def fetch_task(session, task_id):

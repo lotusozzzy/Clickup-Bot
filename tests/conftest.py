@@ -21,12 +21,15 @@ SECRET = "test-secret-12345"
 @pytest.fixture
 def webhook_env(tmp_path, monkeypatch):
     db_file = tmp_path / "test_webhook.db"
+    snapshot_file = tmp_path / "test_snapshot.json"
     monkeypatch.setenv("WEBHOOK_DB_PATH", str(db_file))
     monkeypatch.setenv("WEBHOOK_SECRET", SECRET)
     monkeypatch.setenv("WEBHOOK_STATS_TOKEN", "test-stats-token")
+    monkeypatch.setenv("WEBHOOK_SNAPSHOT_PATH", str(snapshot_file))
+    monkeypatch.setenv("CLICKUP_API_TOKEN", "test-clickup-token")
 
-    # Module-level WEBHOOK_SECRET / DB_PATH değerleri import sırasında
-    # okunduğu için fresh import zorla.
+    # Module-level WEBHOOK_SECRET / DB_PATH / SNAPSHOT_PATH değerleri import
+    # sırasında okunduğu için fresh import zorla.
     for mod_name in list(sys.modules):
         if mod_name == "webhook" or mod_name.startswith("webhook."):
             del sys.modules[mod_name]
@@ -39,6 +42,7 @@ def webhook_env(tmp_path, monkeypatch):
         "receiver": receiver,
         "db": db,
         "db_path": str(db_file),
+        "snapshot_path": str(snapshot_file),
     }
 
 
