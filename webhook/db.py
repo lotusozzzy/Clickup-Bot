@@ -66,6 +66,41 @@ def get_connection(db_path=None):
 _BATCH_SIZE = 500
 
 
+def get_deletions_in_window(since_ms, db_path=None):
+    """Pencere içinde gelen silme event'lerini DESC sıralı döndür.
+
+    field IN ('__deleted__', '__deleted_raw__') — daily report her ikisini de
+    aynı sheet'te gösteriyor. raw satırlarda before_value None'dur (snapshot
+    miss durumu); consumer JSON parse'ı kendi yapar.
+
+    Parametreler:
+        since_ms: int — bu epoch_ms değerinden SONRAKİ silmeler döner.
+                        None gelirse boş liste (önceki snapshot yok demek).
+
+    Dönüş:
+        list[dict]: {task_id, field, before_value, changed_at_ms}
+    """
+    if since_ms is None:
+        return []
+    sql = """
+        SELECT task_id, field, before_value, changed_at_ms
+        FROM events
+        WHERE field IN ('__deleted__', '__deleted_raw__')
+          AND changed_at_ms > ?
+        ORDER BY changed_at_ms DESC
+    """
+    rows = []
+    with get_connection(db_path) as conn:
+        for r in conn.execute(sql, (since_ms,)):
+            rows.append({
+                "task_id": r[0],
+                "field": r[1],
+                "before_value": r[2],
+                "changed_at_ms": r[3],
+            })
+    return rows
+
+
 def get_due_date_events_batch(task_ids, since_ms, db_path=None):
     """Bir grup task için 'due_date' değişikliği event'lerini topluca çek.
 

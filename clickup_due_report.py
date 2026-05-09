@@ -66,7 +66,7 @@ from clickup_bot import (
     safe_get,
 )
 
-from webhook.db import get_due_date_events_batch
+from webhook.db import get_deletions_in_window, get_due_date_events_batch
 
 EXCLUDE_SPACE = "Cariler"
 SNAPSHOT_FILE = os.path.join(
@@ -96,6 +96,16 @@ def fmt_date(ms_str):
         ts = int(s) / 1000
         return datetime.datetime.fromtimestamp(ts).strftime("%d.%m.%Y")
     except (ValueError, TypeError):
+        return ""
+
+
+def fmt_datetime(ms):
+    """Milisaniye epoch'tan 'gg.aa.yyyy SS:DD' formatına. Boş → ''."""
+    if not ms:
+        return ""
+    try:
+        return datetime.datetime.fromtimestamp(int(ms) / 1000).strftime("%d.%m.%Y %H:%M")
+    except (ValueError, TypeError, OSError):
         return ""
 
 
@@ -572,6 +582,70 @@ def diff_snapshots(prev, curr, session, my_user_id):
     return changed_with_comment, changed_no_comment, removed, metrics
 
 
+# ----- Silinen task satırı normalleştirme ----------------------------------
+
+_COMMENT_TEXT_TRUNCATE = 500
+
+
+def _parse_deletion_row(row):
+    """get_deletions_in_window satırını sheet hücrelerine uygun dict'e çevir.
+
+    field='__deleted__'      → before_value JSON parse (zenginleştirilmiş)
+    field='__deleted_raw__'  → snapshot miss; sadece task_id ve silinme
+                                zamanı dolu, diğerleri boş.
+    JSON parse hatası: graceful — partial row, "(snapshot dışı)".
+    Yorum metni 500 karaktere kırpılır.
+    """
+    field = row.get("field") or ""
+    task_id = row.get("task_id") or ""
+    deleted_at_ms = row.get("changed_at_ms") or 0
+
+    parsed = {
+        "field": field,
+        "task_id": task_id,
+        "task_name": "",
+        "space_name": "",
+        "list_name": "",
+        "last_due_date": "",
+        "assignees_str": "",
+        "last_comment_author": "",
+        "last_comment_text": "",
+        "deleted_at": fmt_datetime(deleted_at_ms),
+    }
+
+    if field != "__deleted__":
+        parsed["task_name"] = "(snapshot dışı)"
+        return parsed
+
+    raw = row.get("before_value")
+    try:
+        d = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+
+    parsed["task_name"] = (d.get("task_name") or "").strip() or "(snapshot dışı)"
+    parsed["space_name"] = d.get("space_name") or ""
+    parsed["list_name"] = d.get("list_name") or ""
+    parsed["last_due_date"] = fmt_date(d.get("last_due_date"))
+
+    assignees = d.get("assignees") or []
+    if isinstance(assignees, list):
+        parsed["assignees_str"] = ", ".join(
+            str(a) for a in assignees if a
+        )
+
+    parsed["last_comment_author"] = d.get("last_comment_author") or ""
+
+    text = d.get("last_comment_text") or ""
+    if len(text) > _COMMENT_TEXT_TRUNCATE:
+        text = text[: _COMMENT_TEXT_TRUNCATE - 3] + "..."
+    parsed["last_comment_text"] = text
+
+    return parsed
+
+
 # ----- Excel & Mail ---------------------------------------------------------
 
 def _add_sheet(wb, title, headers, rows, table_name, header_fill, header_font,
@@ -627,8 +701,9 @@ def _add_sheet(wb, title, headers, rows, table_name, header_fill, header_font,
         ws.add_table(tab)
 
 
-def write_excel(changed_with, changed_no, removed, atlanan_listeler=None):
+def write_excel(changed_with, changed_no, removed, atlanan_listeler=None, deletions=None):
     atlanan_listeler = atlanan_listeler or []
+    deletions = deletions or []
     dosya = f"Tarih_Degisiklik_Raporu_{datetime.datetime.now().strftime('%d_%m_%Y')}.xlsx"
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -674,6 +749,23 @@ def write_excel(changed_with, changed_no, removed, atlanan_listeler=None):
           r.get("changer", ""), r.get("yorum_tahmin", ""), r["url"]]
          for r in removed],
         "Tbl_Kaldirildi",
+        header_fill, header_font, wrap_alignment, thin_border,
+    )
+
+    headers_deleted = [
+        "Task İsmi", "Space", "Liste",
+        "Son Bilinen Tarih", "Atayanlar",
+        "Son Yorumlayan", "Son Yorum",
+        "Silinme Zamanı", "Task ID",
+    ]
+    _add_sheet(
+        wb, "Silinen Task'lar", headers_deleted,
+        [[d["task_name"], d["space_name"], d["list_name"],
+          d["last_due_date"], d["assignees_str"],
+          d["last_comment_author"], d["last_comment_text"],
+          d["deleted_at"], d["task_id"]]
+         for d in deletions],
+        "Tbl_Silinen",
         header_fill, header_font, wrap_alignment, thin_border,
     )
 
@@ -737,6 +829,19 @@ def send_mail(dosya, me_info, summary, is_first_run):
                     f'bu oran düşer.</p>'
                 )
 
+        # Silinen task'lar — ClickUp non-Enterprise'da "kim sildi" alınamaz.
+        silindi = summary.get("silindi", 0)
+        silindi_disclaimer = ""
+        if silindi > 0:
+            silindi_disclaimer = (
+                '<p style="background:#e7f3fe; padding:12px; '
+                'border-left:4px solid #2196f3;">'
+                'ℹ️ <b>Silinen task\'lar:</b> ClickUp non-Enterprise plan\'da silen '
+                'kullanıcı bilgisi alınamaz. Bu liste TÜM silmeleri içerir, kendi '
+                'yaptıklarınız dahil. Tanımadığınız bir silme görürseniz ClickUp '
+                'arayüzünden geri yükleyebilirsiniz (Trash).</p>'
+            )
+
         baglamno_tu = (
             '<p style="color:#888;font-size:12px;font-style:italic;">'
             'Atıf bilgileri webhook receiver tarafından gerçek zamanlı yakalanan '
@@ -747,6 +852,7 @@ def send_mail(dosya, me_info, summary, is_first_run):
         <html><body style="font-family: Arial, sans-serif; color: #{SF_GRAY};">
           <h2 style="color: #{SF_ORANGE};">Günlük Tarih Değişikliği Raporu</h2>
           {atif_uyarisi}
+          {silindi_disclaimer}
           <p>Bir önceki çalıştırmadan bu yana tespit edilen değişiklikler ekteki Excel dosyasındadır.
              Tarihi kim değiştirdiği webhook event store'undan okunur;
              <b>{me_info.get('username', '')}</b> tarafından yapılan değişiklikler raporda yer almaz.</p>
@@ -754,6 +860,7 @@ def send_mail(dosya, me_info, summary, is_first_run):
             <li><b>Tarih değişti (yorum var):</b> {summary['degisti_yorumlu']}</li>
             <li><b>Tarih değişti (yorum yok):</b> {summary['degisti_yorumsuz']}</li>
             <li><b>Tarih kaldırıldı:</b> {summary['kaldirildi']}</li>
+            <li><b>Silindi:</b> {silindi}</li>
           </ul>
           {atlanan_uyari}
           {baglamno_tu}
@@ -763,6 +870,8 @@ def send_mail(dosya, me_info, summary, is_first_run):
             no_events={m.get('no_events', 0)},
             filtered_self_only={m.get('filtered_self_only', 0)},
             total_diff={m.get('total_diff', 0)}.
+            Silmeler: deletions={silindi},
+            deletions_enriched={summary.get('deletions_enriched', 0)}.
           </p>
         </body></html>
         """
@@ -817,22 +926,40 @@ def main():
         prev, current, session, me["id"]
     )
 
+    # Silinen task'lar — webhook event store'da __deleted__ / __deleted_raw__
+    snapshot_taken_ms = _snapshot_saved_at_ms(prev)
+    deletion_rows = get_deletions_in_window(snapshot_taken_ms)
+    deletions = [_parse_deletion_row(r) for r in deletion_rows]
+    deletions_enriched = sum(1 for d in deletions if d["field"] == "__deleted__")
+    enriched_pct = (
+        deletions_enriched / max(len(deletions), 1) * 100
+        if deletions else 0
+    )
+    log(
+        f"📊 Silinen task'lar: deletions={len(deletions)}, "
+        f"enriched={deletions_enriched} ({enriched_pct:.0f}%)"
+    )
+
     log(
         f"📊 Sonuç: değişti+yorum={len(changed_with)}, "
         f"değişti-yorum={len(changed_no)}, kaldırıldı={len(removed)}, "
-        f"atlanan liste={len(atlanan_listeler)}."
+        f"silindi={len(deletions)}, atlanan liste={len(atlanan_listeler)}."
     )
 
-    if not (changed_with or changed_no or removed or atlanan_listeler):
+    if not (changed_with or changed_no or removed or deletions or atlanan_listeler):
         log("ℹ️ Bu çalıştırmada değişiklik tespit edilmedi, mail gönderilmiyor.")
         save_snapshot(current)
         return
 
-    dosya = write_excel(changed_with, changed_no, removed, atlanan_listeler)
+    dosya = write_excel(
+        changed_with, changed_no, removed, atlanan_listeler, deletions
+    )
     summary = {
         "degisti_yorumlu": len(changed_with),
         "degisti_yorumsuz": len(changed_no),
         "kaldirildi": len(removed),
+        "silindi": len(deletions),
+        "deletions_enriched": deletions_enriched,
         "atlanan": len(atlanan_listeler),
         "metrics": metrics,
     }
