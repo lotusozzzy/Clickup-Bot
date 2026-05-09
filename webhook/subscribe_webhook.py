@@ -41,7 +41,7 @@ import requests  # noqa: E402
 ENDPOINT = os.environ.get(
     "WEBHOOK_ENDPOINT", "https://webhook.solarfame.com/clickup-webhook"
 )
-EVENTS = ["taskUpdated"]  # tüm task güncellemeleri; receiver due_date filtreler
+EVENTS = ["taskUpdated", "taskDeleted"]  # receiver due_date filtreler + taskDeleted'i __deleted_raw__ olarak saklar
 ENV_FILE = Path("~/clickup-bot/.env").expanduser()
 RESPONSE_FILE = Path(
     os.path.dirname(os.path.abspath(__file__))
