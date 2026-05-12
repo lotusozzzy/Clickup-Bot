@@ -6,6 +6,7 @@ __pycache__/
 venv/
 .env
 due_date_snapshot.json
+snapshot_history/
 cron.log
 cron_daily.log
 manual.log

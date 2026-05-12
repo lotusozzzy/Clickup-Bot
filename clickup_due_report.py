@@ -33,6 +33,8 @@ edilir; o da değerleri os.environ'dan okur.
 import datetime
 import json
 import os
+import re
+import shutil
 import signal
 import smtplib
 import sys
@@ -72,6 +74,13 @@ EXCLUDE_SPACE = "Cariler"
 SNAPSHOT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "due_date_snapshot.json"
 )
+SNAPSHOT_HISTORY_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "snapshot_history"
+)
+SNAPSHOT_HISTORY_KEEP = 5
+# Sadece bu pattern'e uyan dosyalar retention dahilinde — README.md, manuel
+# yedekler vb. dokunulmaz.
+_SNAPSHOT_HISTORY_NAME_RE = re.compile(r"^snapshot_\d{8}_\d{6}\.json$")
 
 
 def _normalize_due(due):
@@ -271,11 +280,16 @@ def load_previous_snapshot():
 
 
 def save_snapshot(snapshot):
-    """Snapshot'ı atomik write+rename ile yaz.
+    """Snapshot'ı atomik write+rename ile yaz; ardından history'ye arşivle.
 
-    Webhook receiver bu dosyayı taskDeleted event'lerinde okuyor — yazma
-    sırasında corrupt JSON ile karşılaşmasın diye .tmp'e yaz, fsync,
-    sonra os.replace() (atomic rename, POSIX + Windows).
+    Ana dosya (SNAPSHOT_FILE): webhook receiver bunu taskDeleted event'lerinde
+    okuyor — yazma sırasında corrupt JSON ile karşılaşmasın diye .tmp'e yaz,
+    fsync, sonra os.replace() (atomic rename, POSIX + Windows).
+
+    History (snapshot_history/snapshot_YYYYMMDD_HHMMSS.json): ana save
+    stabilize olduktan sonra timestamp'li kopya atılır ve son
+    SNAPSHOT_HISTORY_KEEP tanesi tutulur. Archive/retention hata verirse
+    log'lanır ama daily run kesilmez — ana save zaten yapılmış oldu.
     """
     payload = {
         "saved_at": datetime.datetime.now().isoformat(),
@@ -287,6 +301,55 @@ def save_snapshot(snapshot):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, SNAPSHOT_FILE)
+
+    try:
+        _archive_snapshot_history(
+            SNAPSHOT_FILE, SNAPSHOT_HISTORY_DIR, SNAPSHOT_HISTORY_KEEP
+        )
+    except OSError as e:
+        log(f"⚠️ Snapshot history archive failed: {e}")
+
+
+def _archive_snapshot_history(source_path, history_dir, keep):
+    """Snapshot'ın timestamp'li kopyasını history klasörüne at; eskileri sil.
+
+    - Klasör yoksa yaratılır.
+    - Dest dosya adı: snapshot_YYYYMMDD_HHMMSS.json (lokal zaman).
+      Aynı saniye içinde iki run olursa shutil.copy2 üzerine yazar; kabul
+      edilebilir trade-off.
+    - Retention: pattern'e uyan dosyaları mtime'a göre yeni→eski sırala,
+      ilk `keep` tane hariç gerisini sil. Pattern dışı (README.md,
+      snapshot_invalid.json vb.) ASLA silinmez.
+    """
+    os.makedirs(history_dir, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest_path = os.path.join(history_dir, f"snapshot_{timestamp}.json")
+    shutil.copy2(source_path, dest_path)
+
+    candidates = []
+    for entry in os.listdir(history_dir):
+        if not _SNAPSHOT_HISTORY_NAME_RE.match(entry):
+            continue
+        full = os.path.join(history_dir, entry)
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            continue
+        candidates.append((mtime, full))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    removed = 0
+    for _mtime, path in candidates[keep:]:
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+
+    kept = min(len(candidates), keep)
+    log(f"📦 Snapshot history: kept {kept}, removed {removed} ({history_dir})")
 
 
 def fetch_task(session, task_id):
