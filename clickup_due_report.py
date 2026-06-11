@@ -2,9 +2,12 @@
 
 Cariler haricindeki tüm Space'lerdeki AÇIK task'lar üzerinde:
   - Bir önceki snapshot'a göre due_date değişen task'ları bulur.
-  - "Değişti + yorum var" → Sekme 1
-  - "Değişti + yorum yok" → Sekme 2
+  - "Değişti + değişiklikten sonraki 8 saat içinde yorum var" → Sekme 1
+    (COMMENT_MATCH_WINDOW_MS, forward-only; task'taki alakasız eski
+    yorumlar kategoriyi etkilemez)
+  - "Değişti + eşleşen yorum yok" → Sekme 2
   - "Önceden tarih vardı, şu an yok" (tarih kaldırıldı) → Sekme 3
+  - Webhook event store'dan silinen task'lar → Sekme 4
 
 ATIF KAYNAĞI (Faz 5'ten itibaren): webhook event store
 (webhook_events.db). ClickUp'a abone olduğumuz webhook 'taskUpdated'
@@ -71,6 +74,10 @@ from clickup_bot import (
 from webhook.db import get_deletions_in_window, get_due_date_events_batch
 
 EXCLUDE_SPACE = "Cariler"
+# "+Yorum" kategorisi: tarih değişikliğinin changed_at_ms'inden itibaren
+# bu pencere İÇİNDE (forward-only) yazılmış en az bir yorum varsa.
+# Task'taki alakasız eski yorumlar kategoriyi etkilemez (bug fix, 11 Haziran).
+COMMENT_MATCH_WINDOW_MS = 8 * 3600 * 1000  # 8 saat
 SNAPSHOT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "due_date_snapshot.json"
 )
@@ -373,26 +380,72 @@ def fetch_task(session, task_id):
 # (webhook_events.db) kullanılıyor — webhook.db.get_due_date_events_batch.
 
 
-def fetch_all_comments(session, task_id):
-    """Task'ın tüm yorumlarını en yeniden eskiye sırala."""
-    r = safe_get(
-        session,
-        f"https://api.clickup.com/api/v2/task/{task_id}/comment",
-        attempt_label=f"comments {task_id}",
-    )
-    if r is None or r.status_code != 200:
-        return []
-    try:
-        comments = r.json().get("comments", []) or []
-    except ValueError:
-        return []
+# ClickUp v2 /comment endpoint'i tek istekte en yeni ~25 yorumu döner.
+# 8h pencere eşleşmesi için daha eskilere inmek gerekebilir; defansif
+# sayfa limiti sonsuz döngü/rate-limit koruması.
+_COMMENT_MAX_EXTRA_PAGES = 8
 
-    def _key(c):
+
+def fetch_all_comments(session, task_id, oldest_needed_ms=None):
+    """Task yorumlarını en yeniden eskiye sıralı getir.
+
+    ClickUp v2 endpoint'i pagination'sız yalnızca en yeni ~25 yorumu döner.
+    oldest_needed_ms verilirse: alınan en eski yorum bu eşikten daha yeniyken
+    'start'+'start_id' parametreleriyle geriye doğru sayfalanır (en fazla
+    _COMMENT_MAX_EXTRA_PAGES ek sayfa). None → tek istek (eski davranış).
+    """
+    base_url = f"https://api.clickup.com/api/v2/task/{task_id}/comment"
+    comments = []
+    seen_ids = set()
+    next_start = None
+    next_start_id = None
+
+    max_pages = 1 + (
+        _COMMENT_MAX_EXTRA_PAGES if oldest_needed_ms is not None else 0
+    )
+    for page_no in range(max_pages):
+        url = base_url
+        if next_start is not None and next_start_id:
+            url = f"{base_url}?start={next_start}&start_id={next_start_id}"
+        r = safe_get(
+            session, url, attempt_label=f"comments {task_id} p{page_no}"
+        )
+        if r is None or r.status_code != 200:
+            break
         try:
-            return int(c.get("date") or 0)
-        except (ValueError, TypeError):
-            return 0
-    comments.sort(key=_key, reverse=True)
+            page = r.json().get("comments", []) or []
+        except ValueError:
+            break
+
+        new_items = []
+        for c in page:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("id")
+            if cid is not None and cid in seen_ids:
+                continue
+            if cid is not None:
+                seen_ids.add(cid)
+            new_items.append(c)
+        if not new_items:
+            break
+        comments.extend(new_items)
+
+        if oldest_needed_ms is None:
+            break
+
+        oldest_c = min(new_items, key=_comment_ts)
+        oldest_ts = _comment_ts(oldest_c)
+        # Eşiğin altına indik veya timestamp parse edilemiyor → dur.
+        if oldest_ts == 0 or oldest_ts <= oldest_needed_ms:
+            break
+        if not oldest_c.get("id"):
+            break
+        next_start = oldest_ts
+        next_start_id = oldest_c.get("id")
+        time.sleep(BASE_SLEEP)
+
+    comments.sort(key=_comment_ts, reverse=True)
     return comments
 
 
@@ -403,6 +456,48 @@ def _extract_comment_text(comment):
         return comment["comment_text"]
     parts = comment.get("comment") or []
     return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+
+
+def _comment_ts(comment):
+    """ClickUp comment objesinin 'date' alanını int ms'e çevir. Hata → 0."""
+    try:
+        return int(comment.get("date") or 0)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _match_comments_to_changes(comments, change_timestamps, window_since_ms):
+    """Tarih değişikliklerine 8 saatlik forward-window ile yorum eşleştir.
+
+    Kural ("+Yorum" kategorisi, 11 Haziran bug fix):
+      - Bir yorum, HERHANGİ bir tarih değişikliğinin changed_at_ms'inden
+        itibaren COMMENT_MATCH_WINDOW_MS içinde yazılmışsa eşleşir:
+        ch <= c_ts <= ch + WINDOW. Forward-only — değişiklikten ÖNCE
+        yazılmış yorum eşleşMEZ.
+      - change_timestamps boş (no_events; webhook event'i yok, değişiklik
+        zamanı bilinmiyor): fallback — yorum rapor penceresi içindeyse
+        (c_ts > window_since_ms) eşleşmiş sayılır. window_since_ms None ise
+        (snapshot saved_at parse edilememiş) hiç eşleşme olmaz.
+
+    Dönüş: eşleşen yorumlar, en yeni en başta.
+    """
+    matched = []
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        c_ts = _comment_ts(c)
+        if not c_ts:
+            continue
+        if change_timestamps:
+            if any(
+                ch <= c_ts <= ch + COMMENT_MATCH_WINDOW_MS
+                for ch in change_timestamps
+            ):
+                matched.append(c)
+        elif window_since_ms is not None and c_ts > window_since_ms:
+            matched.append(c)
+    matched.sort(key=_comment_ts, reverse=True)
+    return matched
 
 
 def _comment_near_date(comments, target_ms, window_hours=24):
@@ -569,17 +664,37 @@ def diff_snapshots(prev, curr, session, my_user_id):
 
         metrics[attr["quality"]] += 1
 
-        # Bağlam için yorumlar (her zaman çekilir; rate-limit'e dikkat)
-        comments = fetch_all_comments(session, tid)
-        time.sleep(BASE_SLEEP)
+        # Kategorize: "task'ta herhangi bir yorum var" DEĞİL — değişiklikten
+        # sonraki 8 saat içinde yazılmış yorum var mı (forward-only).
+        # Gösterilen yorum da eşleşenlerin en yenisi; alakasız eski yorumlar
+        # ne kategoriyi ne de kolonları etkiler.
+        change_ts_list = [
+            e["changed_at_ms"] for e in events if e.get("changed_at_ms")
+        ]
 
-        last_c = comments[0] if comments else None
+        # Yorumlar: pencere eşleşmesi en eski değişikliğe kadar inmeli;
+        # _comment_near_date (yorum_tahmin) ±24h baktığı için o kadar padding.
+        # Tek sayfa ~25 yorum yettiğinde ek istek atılmaz.
+        _candidates = change_ts_list or (
+            [snapshot_taken_ms] if snapshot_taken_ms else []
+        )
+        oldest_needed = (
+            min(_candidates) - 24 * 3600 * 1000 if _candidates else None
+        )
+        comments = fetch_all_comments(
+            session, tid, oldest_needed_ms=oldest_needed
+        )
+        time.sleep(BASE_SLEEP)
+        matched_comments = _match_comments_to_changes(
+            comments, change_ts_list, snapshot_taken_ms
+        )
+        matched_c = matched_comments[0] if matched_comments else None
         last_comment_by = ""
         last_comment_text = ""
-        if last_c:
-            user = last_c.get("user") or {}
+        if matched_c:
+            user = matched_c.get("user") or {}
             last_comment_by = user.get("username", "")
-            last_comment_text = _extract_comment_text(last_c)
+            last_comment_text = _extract_comment_text(matched_c)
 
         # Fallback: webhook event yoksa, date_updated'a yakın yorumu tahmini değiştiren olarak göster
         yorum_tahmin = ""
@@ -621,7 +736,7 @@ def diff_snapshots(prev, curr, session, my_user_id):
             continue
 
         row["new_date"] = fmt_date(curr_due)
-        if last_c:
+        if matched_c:
             changed_with_comment.append(row)
         else:
             row["last_comment_by"] = ""
