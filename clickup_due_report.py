@@ -2,9 +2,9 @@
 
 Cariler haricindeki tüm Space'lerdeki AÇIK task'lar üzerinde:
   - Bir önceki snapshot'a göre due_date değişen task'ları bulur.
-  - "Değişti + değişiklikten sonraki 8 saat içinde yorum var" → Sekme 1
-    (COMMENT_MATCH_WINDOW_MS, forward-only; task'taki alakasız eski
-    yorumlar kategoriyi etkilemez)
+  - "Değişti + değişiklik anına ±8 saat içinde yorum var" → Sekme 1
+    (COMMENT_MATCH_WINDOW_MS, simetrik; ekip önce yorum yazıp sonra tarihi
+    değiştirebildiği için her iki yön; alakasız eski yorumlar etkilemez)
   - "Değişti + eşleşen yorum yok" → Sekme 2
   - "Önceden tarih vardı, şu an yok" (tarih kaldırıldı) → Sekme 3
   - Webhook event store'dan silinen task'lar → Sekme 4
@@ -74,10 +74,11 @@ from clickup_bot import (
 from webhook.db import get_deletions_in_window, get_due_date_events_batch
 
 EXCLUDE_SPACE = "Cariler"
-# "+Yorum" kategorisi: tarih değişikliğinin changed_at_ms'inden itibaren
-# bu pencere İÇİNDE (forward-only) yazılmış en az bir yorum varsa.
-# Task'taki alakasız eski yorumlar kategoriyi etkilemez (bug fix, 11 Haziran).
-COMMENT_MATCH_WINDOW_MS = 8 * 3600 * 1000  # 8 saat
+# "+Yorum" kategorisi: tarih değişikliğinin changed_at_ms'ine ±bu pencere
+# yakınlıkta (her iki yönde) yazılmış en az bir yorum varsa. Ekip önce yorum
+# yazıp sonra tarihi değiştirebildiği için simetrik (17 Haz). Task'taki
+# alakasız eski yorumlar kategoriyi etkilemez (11 Haz forward-only fix'i).
+COMMENT_MATCH_WINDOW_MS = 8 * 3600 * 1000  # 8 saat (her yöne)
 SNAPSHOT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "due_date_snapshot.json"
 )
@@ -467,13 +468,15 @@ def _comment_ts(comment):
 
 
 def _match_comments_to_changes(comments, change_timestamps, window_since_ms):
-    """Tarih değişikliklerine 8 saatlik forward-window ile yorum eşleştir.
+    """Tarih değişikliklerine ±8 saatlik simetrik pencere ile yorum eşleştir.
 
-    Kural ("+Yorum" kategorisi, 11 Haziran bug fix):
-      - Bir yorum, HERHANGİ bir tarih değişikliğinin changed_at_ms'inden
-        itibaren COMMENT_MATCH_WINDOW_MS içinde yazılmışsa eşleşir:
-        ch <= c_ts <= ch + WINDOW. Forward-only — değişiklikten ÖNCE
-        yazılmış yorum eşleşMEZ.
+    Kural ("+Yorum" kategorisi):
+      - Bir yorum, HERHANGİ bir tarih değişikliğinin changed_at_ms'ine
+        COMMENT_MATCH_WINDOW_MS yakınlıkta (her iki yönde) yazılmışsa eşleşir:
+        ch - WINDOW <= c_ts <= ch + WINDOW. Simetrik — ekip genelde önce
+        açıklama yorumu yazıp saniyeler/dakikalar sonra tarihi değiştirdiği
+        için yorum değişiklikten ÖNCE de olabilir (17 Haz bug). Sıra önemsiz,
+        yakınlık önemli. (11 Haz'da forward-only idi, gerçek veriyle değişti.)
       - change_timestamps boş (no_events; webhook event'i yok, değişiklik
         zamanı bilinmiyor): fallback — yorum rapor penceresi içindeyse
         (c_ts > window_since_ms) eşleşmiş sayılır. window_since_ms None ise
@@ -490,7 +493,7 @@ def _match_comments_to_changes(comments, change_timestamps, window_since_ms):
             continue
         if change_timestamps:
             if any(
-                ch <= c_ts <= ch + COMMENT_MATCH_WINDOW_MS
+                ch - COMMENT_MATCH_WINDOW_MS <= c_ts <= ch + COMMENT_MATCH_WINDOW_MS
                 for ch in change_timestamps
             ):
                 matched.append(c)

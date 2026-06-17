@@ -74,50 +74,120 @@ def test_comment_9h_after_change_no_match(monkeypatch, tmp_path):
     assert matched == []
 
 
-def test_comment_before_change_no_match_forward_only(monkeypatch, tmp_path):
-    """Test 3: yorum T-1h (değişiklikten önce) → forward-only, eşleşmez."""
+def test_comment_9s_before_change_matches(monkeypatch, tmp_path):
+    """Test 1 (BUG REPRO): yorum değişiklikten 9 sn ÖNCE → simetrik pencerede
+    eşleşir. Forward-only mantıkta FAIL ederdi (ekip önce yorum yazıyor)."""
     cdr = _import_due_report(monkeypatch, tmp_path)
     T = 1_750_000_000_000
     matched = cdr._match_comments_to_changes(
-        [_comment(T - 1 * HOUR_MS)], [T], window_since_ms=T - 24 * HOUR_MS
+        [_comment(T - 9_000)], [T], window_since_ms=T - 24 * HOUR_MS
+    )
+    assert len(matched) == 1
+
+
+def test_comment_5s_after_change_matches(monkeypatch, tmp_path):
+    """Test 2: yorum 5 sn SONRA → eşleşir (korundu)."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    T = 1_750_000_000_000
+    matched = cdr._match_comments_to_changes(
+        [_comment(T + 5_000)], [T], window_since_ms=None
+    )
+    assert len(matched) == 1
+
+
+def test_comment_7h_before_change_matches(monkeypatch, tmp_path):
+    """Test 3: yorum 7 saat ÖNCE (sol sınır içi) → eşleşir."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    T = 1_750_000_000_000
+    matched = cdr._match_comments_to_changes(
+        [_comment(T - 7 * HOUR_MS)], [T], window_since_ms=None
+    )
+    assert len(matched) == 1
+
+
+def test_comment_9h_before_change_no_match(monkeypatch, tmp_path):
+    """Test 4: yorum 9 saat ÖNCE (sol sınır dışı) → eşleşmez."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    T = 1_750_000_000_000
+    matched = cdr._match_comments_to_changes(
+        [_comment(T - 9 * HOUR_MS)], [T], window_since_ms=None
+    )
+    assert matched == []
+
+
+def test_comment_7h_after_change_matches(monkeypatch, tmp_path):
+    """Test 5: yorum 7 saat SONRA (sağ sınır içi) → eşleşir."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    T = 1_750_000_000_000
+    matched = cdr._match_comments_to_changes(
+        [_comment(T + 7 * HOUR_MS)], [T], window_since_ms=None
+    )
+    assert len(matched) == 1
+
+
+def test_comment_9h_after_change_no_match_symmetric(monkeypatch, tmp_path):
+    """Test 6: yorum 9 saat SONRA (sağ sınır dışı) → eşleşmez."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    T = 1_750_000_000_000
+    matched = cdr._match_comments_to_changes(
+        [_comment(T + 9 * HOUR_MS)], [T], window_since_ms=None
     )
     assert matched == []
 
 
 def test_exact_boundaries_inclusive(monkeypatch, tmp_path):
-    """Sınır kontrolü: c_ts == ch ve c_ts == ch+8h tam sınırda eşleşir."""
+    """Test 7/8: sol ve sağ sınır kesin kontrolü.
+    c_ts == ch-WINDOW ve ch+WINDOW dahil; ±1ms dışı hariç."""
     cdr = _import_due_report(monkeypatch, tmp_path)
     T = 1_750_000_000_000
-    at_start = cdr._match_comments_to_changes(
+    W = cdr.COMMENT_MATCH_WINDOW_MS
+
+    left_edge = cdr._match_comments_to_changes(
+        [_comment(T - W)], [T], window_since_ms=None
+    )
+    left_past = cdr._match_comments_to_changes(
+        [_comment(T - W - 1)], [T], window_since_ms=None
+    )
+    at_change = cdr._match_comments_to_changes(
         [_comment(T)], [T], window_since_ms=None
     )
-    at_end = cdr._match_comments_to_changes(
-        [_comment(T + cdr.COMMENT_MATCH_WINDOW_MS)], [T], window_since_ms=None
+    right_edge = cdr._match_comments_to_changes(
+        [_comment(T + W)], [T], window_since_ms=None
     )
-    just_past = cdr._match_comments_to_changes(
-        [_comment(T + cdr.COMMENT_MATCH_WINDOW_MS + 1)], [T], window_since_ms=None
+    right_past = cdr._match_comments_to_changes(
+        [_comment(T + W + 1)], [T], window_since_ms=None
     )
-    assert len(at_start) == 1
-    assert len(at_end) == 1
-    assert just_past == []
+    assert len(left_edge) == 1     # Test 7: tam -8h dahil
+    assert left_past == []         # Test 8: -8h - 1ms hariç
+    assert len(at_change) == 1
+    assert len(right_edge) == 1
+    assert right_past == []
 
 
 def test_two_changes_any_match_suffices(monkeypatch, tmp_path):
-    """Test 4: T1, T2=T1+12h; yorum T1+10h → ikisine de uymaz (T1+8h geçti,
-    T2'den önce/forward-only). Yorum T2+3h → T2 ile eşleşir."""
+    """Test 9: T1, T2=T1+20h (pencereler arası gerçek boşluk var).
+    Boşluktaki yorum (T1+10h) hiçbiriyle eşleşmez; T1 öncesi/T2 yakını eşleşir."""
     cdr = _import_due_report(monkeypatch, tmp_path)
     T1 = 1_750_000_000_000
-    T2 = T1 + 12 * HOUR_MS
+    T2 = T1 + 20 * HOUR_MS  # 20h > 2*8h → [T1±8h] ve [T2±8h] çakışmaz
 
+    # T1+10h: T1'den 10h (>8h), T2'den 10h (>8h) → boşlukta, eşleşmez
     no_match = cdr._match_comments_to_changes(
         [_comment(T1 + 10 * HOUR_MS)], [T1, T2], window_since_ms=None
     )
     assert no_match == []
 
-    match = cdr._match_comments_to_changes(
+    # T1-3h: T1'in sol penceresinde → eşleşir (herhangi biriyle yeter)
+    m1 = cdr._match_comments_to_changes(
+        [_comment(T1 - 3 * HOUR_MS)], [T1, T2], window_since_ms=None
+    )
+    assert len(m1) == 1
+
+    # T2+3h: T2'nin sağ penceresinde → eşleşir
+    m2 = cdr._match_comments_to_changes(
         [_comment(T2 + 3 * HOUR_MS)], [T1, T2], window_since_ms=None
     )
-    assert len(match) == 1
+    assert len(m2) == 1
 
 
 def test_no_events_fallback_comment_in_report_window(monkeypatch, tmp_path):
