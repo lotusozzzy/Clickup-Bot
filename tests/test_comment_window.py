@@ -445,3 +445,152 @@ def test_diff_self_only_still_skipped(monkeypatch, tmp_path):
     )
     assert with_c == [] and no_c == [] and removed == []
     assert m["filtered_self_only"] == 1
+
+
+# ---------------------------------------------------------------------------
+# "Olası Değiştiren (yorum)" kolonu pencere hizalaması (15 Haz bug fix)
+# ---------------------------------------------------------------------------
+#
+# Önceki testler fetch_task'i None döndürüyordu → yorum_tahmin hiç
+# hesaplanmıyordu, bu yüzden çelişki yakalanamamıştı. Aşağıdaki helper gerçek
+# diff_snapshots akışını date_updated dolu + gerçekçi yorumlarla çalıştırır.
+
+def _run_diff_no_events(cdr, monkeypatch, *, saved_at_ms, comments,
+                        date_updated_ms, is_removed=False, my_user_id="999"):
+    """no_events senaryosu: webhook event'i YOK (change_ts boş), fetch_task
+    gerçek date_updated döndürür, fetch_all_comments verilen yorumları döner.
+
+    is_removed=True → curr due None (Tarih Kaldırıldı sheet'i).
+    """
+    saved_at_iso = datetime.datetime.fromtimestamp(
+        saved_at_ms / 1000
+    ).isoformat()
+    prev = {"saved_at": saved_at_iso,
+            "tasks": {"t1": _task_entry("1700000000000")}}
+    if is_removed:
+        curr = {"t1": _task_entry(None)}
+    else:
+        curr = {"t1": _task_entry("1700090000000")}
+
+    # no_events: event store boş döner
+    monkeypatch.setattr(
+        cdr, "get_due_date_events_batch",
+        lambda ids, since, db_path=None: {tid: [] for tid in ids},
+    )
+    monkeypatch.setattr(
+        cdr, "fetch_all_comments",
+        lambda session, tid, oldest_needed_ms=None: list(comments),
+    )
+    monkeypatch.setattr(
+        cdr, "fetch_task",
+        lambda session, tid: {"date_updated": str(date_updated_ms)},
+    )
+    monkeypatch.setattr(cdr.time, "sleep", lambda s: None)
+
+    return cdr.diff_snapshots(prev, curr, session=None, my_user_id=my_user_id)
+
+
+def test_olasi_degistiren_blanked_for_out_of_window_comment(monkeypatch, tmp_path):
+    """15 Haz bug repro: yorum pencere ÖNCESİNDEN ama date_updated'a ±24h yakın.
+    Sheet 'Yorum Yok' VE 'Olası Değiştiren' (yorum_tahmin) boş olmalı — çelişki yok."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    saved_at = 1_750_000_000_000
+    # Yorum pencereden 6 saat ÖNCE (12 Haz Selin yorumu senaryosu)
+    comment_ts = saved_at - 6 * HOUR_MS
+    # date_updated yoruma yakın (±24h içinde) → eski kodda kolon dolardı
+    date_updated = comment_ts + 3 * HOUR_MS
+
+    with_c, no_c, removed, m = _run_diff_no_events(
+        cdr, monkeypatch, saved_at_ms=saved_at,
+        comments=[_comment(comment_ts, username="Selin Aslandoğdu")],
+        date_updated_ms=date_updated,
+    )
+    assert with_c == []
+    assert len(no_c) == 1
+    assert m["no_events"] == 1
+    # Çelişki düzeltmesi: pencere dışı yorum → kolon boş
+    assert no_c[0]["yorum_tahmin"] == ""
+
+
+def test_olasi_degistiren_shown_for_in_window_comment(monkeypatch, tmp_path):
+    """Yorum pencere İÇİNDE + date_updated'a yakın → sheet '+Yorum' VE
+    'Olası Değiştiren' dolu (mevcut faydalı davranış korunur)."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    saved_at = 1_750_000_000_000
+    comment_ts = saved_at + 5 * HOUR_MS   # pencere içi
+    date_updated = comment_ts + 1 * HOUR_MS
+
+    with_c, no_c, removed, m = _run_diff_no_events(
+        cdr, monkeypatch, saved_at_ms=saved_at,
+        comments=[_comment(comment_ts, username="Selin Aslandoğdu")],
+        date_updated_ms=date_updated,
+    )
+    # Pencere içi yorum → +Yorum sheet'i
+    assert len(with_c) == 1
+    assert no_c == []
+    assert with_c[0]["yorum_tahmin"] == "Selin Aslandoğdu"
+
+
+def test_olasi_degistiren_blanked_on_removed_sheet(monkeypatch, tmp_path):
+    """Tarih Kaldırıldı sheet'i de aynı yorum_tahmin mekanizmasını kullanır;
+    pencere dışı yorum orada da boşaltılmalı."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    saved_at = 1_750_000_000_000
+    comment_ts = saved_at - 6 * HOUR_MS
+    date_updated = comment_ts + 2 * HOUR_MS
+
+    with_c, no_c, removed, m = _run_diff_no_events(
+        cdr, monkeypatch, saved_at_ms=saved_at,
+        comments=[_comment(comment_ts, username="Selin Aslandoğdu")],
+        date_updated_ms=date_updated,
+        is_removed=True,
+    )
+    assert with_c == [] and no_c == []
+    assert len(removed) == 1
+    assert removed[0]["yorum_tahmin"] == ""
+
+
+def test_olasi_degistiren_shown_in_window_on_removed_sheet(monkeypatch, tmp_path):
+    """Tarih Kaldırıldı + pencere içi yorum → kolon dolu kalır (regresyon değil)."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    saved_at = 1_750_000_000_000
+    comment_ts = saved_at + 4 * HOUR_MS
+    date_updated = comment_ts + 1 * HOUR_MS
+
+    with_c, no_c, removed, m = _run_diff_no_events(
+        cdr, monkeypatch, saved_at_ms=saved_at,
+        comments=[_comment(comment_ts, username="Selin Aslandoğdu")],
+        date_updated_ms=date_updated,
+        is_removed=True,
+    )
+    assert len(removed) == 1
+    assert removed[0]["yorum_tahmin"] == "Selin Aslandoğdu"
+
+
+def test_olasi_degistiren_picks_only_in_window_among_mixed(monkeypatch, tmp_path):
+    """date_updated'a en yakın yorum pencere dışı ama pencere içinde de
+    başka yorum var: _comment_near_date en yakını (pencere dışı) seçerse
+    gate onu boşaltır. Sheet seçimi pencere içi yorumla '+Yorum' kalır.
+
+    Bu, kolon (en-yakın) ile sheet (pencere) mantıklarının ayrı olduğunu
+    ve gate'in yalnızca kolonu pencereye sabitlediğini doğrular."""
+    cdr = _import_due_report(monkeypatch, tmp_path)
+    saved_at = 1_750_000_000_000
+    out_win = saved_at - 1 * HOUR_MS      # pencere dışı, date_updated'a çok yakın
+    in_win = saved_at + 10 * HOUR_MS      # pencere içi ama date_updated'tan uzak
+    date_updated = saved_at               # en yakın = out_win
+
+    with_c, no_c, removed, m = _run_diff_no_events(
+        cdr, monkeypatch, saved_at_ms=saved_at,
+        comments=[
+            _comment(out_win, username="PencereDışı"),
+            _comment(in_win, username="PencereİçiYorum"),
+        ],
+        date_updated_ms=date_updated,
+    )
+    # Sheet seçimi: pencere içi yorum var → +Yorum
+    assert len(with_c) == 1
+    # Son Yorumu Yazan = eşleşen (pencere içi) yorum
+    assert with_c[0]["last_comment_by"] == "PencereİçiYorum"
+    # Olası Değiştiren: en-yakın pencere dışı → boşaltıldı
+    assert with_c[0]["yorum_tahmin"] == ""

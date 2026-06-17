@@ -708,7 +708,18 @@ def diff_snapshots(prev, curr, session, my_user_id):
                     date_updated_ms = 0
                 if date_updated_ms:
                     near = _comment_near_date(comments, date_updated_ms)
-                    if near:
+                    # "Olası Değiştiren" SADECE rapor penceresi İÇİNDE yazılmış
+                    # yorumu göstersin. _comment_near_date date_updated'a ±24h
+                    # baktığı için pencere dışı eski yorumları da bulabiliyordu;
+                    # bu, "Yorum Yok" satırında dolu "Olası Değiştiren" gibi
+                    # çelişkili bir görüntüye yol açıyordu (15 Haz bug). Gate,
+                    # _match_comments_to_changes'in window_since_ms guard'ıyla
+                    # birebir tutarlı: snapshot_taken_ms None ise gösterme.
+                    if (
+                        near
+                        and snapshot_taken_ms is not None
+                        and _comment_ts(near) > snapshot_taken_ms
+                    ):
                         near_user = near.get("user") or {}
                         yorum_tahmin = near_user.get("username") or ""
 
