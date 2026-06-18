@@ -430,10 +430,82 @@ def test_write_excel_builds_file(monkeypatch, tmp_path):
     import openpyxl
     mod, _ = _import_module(monkeypatch, tmp_path)
     monkeypatch.chdir(tmp_path)  # repo'yu kirletme
-    rows = [["Ad", "Açıklama", "Yorum", "01.01.2026", "01.01.2026 10:00",
-             "urgent", "2"]]
+    rows = [["Ad", "ilk temas", "Açıklama", "Yorum", "01.01.2026",
+             "01.01.2026 10:00", "urgent", "2"]]
     dosya = mod.write_excel(rows)
     assert os.path.exists(dosya)
     ws = openpyxl.load_workbook(dosya)["Pipeline"]
     assert [c.value for c in ws[1]] == mod.COLUMNS
     assert [c.value for c in ws[2]] == rows[0]
+
+
+# ---------------------------------------------------------------------------
+# Kolonlar: 8 kolon, "Aşama" 2. sırada; status çekimi; tam metin / rstrip
+# ---------------------------------------------------------------------------
+def test_columns_are_8_in_spec_order(monkeypatch, tmp_path):
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    assert mod.COLUMNS == [
+        "Müşteri/Task Adı", "Aşama", "Açıklama", "Son Yorum",
+        "Bitiş Tarihi", "Son Güncelleme", "Öncelik", "Yorum Sayısı",
+    ]
+
+
+def test_get_status_dict_string_missing(monkeypatch, tmp_path):
+    """Ham /list/task status'u DICT döner; string'e normalize edilmiş hali de
+    desteklenir; yoksa ''."""
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    assert mod.get_status({"status": {"status": "ilk temas", "color": "#x"}}) == "ilk temas"
+    assert mod.get_status({"status": "potansiyel alıcı"}) == "potansiyel alıcı"
+    assert mod.get_status({}) == ""
+    assert mod.get_status({"status": None}) == ""
+
+
+def test_build_rows_8col_projection(monkeypatch, tmp_path):
+    """build_rows 8 kolonu doğru sırayla üretir; Aşama=status, 2. kolonda."""
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod, "fetch_all_comments",
+                        lambda s, tid: [{"id": "c", "date": "2", "comment_text": "son yorum"}])
+    monkeypatch.setattr(mod, "time", _NoSleep())
+    task = {
+        "id": "t", "name": "Murat", "status": {"status": "ilk temas"},
+        "due_date": "1785135600000", "date_updated": "1781708619365",
+        "priority": {"priority": "urgent"},
+        "custom_fields": [{"id": mod.DESC_CF_ID, "type": "text", "value": "kümes sahibi"}],
+    }
+    rows = mod.build_rows(None, [task])
+    assert len(rows) == 1 and len(rows[0]) == 8
+    r = rows[0]
+    assert r[0] == "Murat"          # Müşteri/Task Adı
+    assert r[1] == "ilk temas"      # Aşama
+    assert r[2] == "kümes sahibi"   # Açıklama
+    assert r[3] == "son yorum"      # Son Yorum
+    assert r[6] == "urgent"         # Öncelik
+    assert r[7] == "1"              # Yorum Sayısı
+
+
+def test_clean_cell_rstrip_keeps_internal_newlines_and_caps(monkeypatch, tmp_path):
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    assert mod._clean_cell("a\nb   \n\n") == "a\nb"   # iç \n kalır, son temizlenir
+    assert mod._clean_cell("  x  ") == "  x"          # sadece rstrip (baş korunur)
+    assert mod._clean_cell(None) == ""
+    big = "y" * 40000
+    assert len(mod._clean_cell(big)) == mod._EXCEL_CELL_MAX  # hard limit
+
+
+def test_long_description_and_comment_not_truncated(monkeypatch, tmp_path):
+    """500'lük cap KALDIRILDI: uzun Açıklama/Son Yorum tam yazılır (sadece
+    rstrip)."""
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    long_text = "k" * 5000
+    task = {"custom_fields": [{"id": mod.DESC_CF_ID, "type": "text",
+                              "value": long_text + "   \n\n"}]}
+    desc = mod.get_description(task)
+    assert desc == long_text  # tam metin, "…" yok, kelime ortasından kesik yok
+    assert len(desc) == 5000
+
+    monkeypatch.setattr(mod, "fetch_all_comments",
+                        lambda s, tid: [{"id": "c", "date": "1",
+                                        "comment_text": long_text + "\n  "}])
+    latest, _count = mod.fetch_comment_summary(None, "x")
+    assert latest == long_text
+    assert len(latest) == 5000

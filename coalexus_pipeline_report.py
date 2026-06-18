@@ -97,11 +97,14 @@ BOOTSTRAP_LOOKBACK_MS = 24 * 3600 * 1000
 # sayısı bu sınıra dayanırsa "25+" gösterilir (Ders 2: 25-yorum limiti).
 COMMENT_PAGE_CAP = 25
 
-# Hücrelerin şişmemesi için uzun metin kırpma sınırı.
-_TEXT_TRUNCATE = 500
+# Excel/openpyxl tek hücre karakter limiti. İçerik cap'i YOK; sadece bu hard
+# limiti aşan istisnai değerleri keseriz (openpyxl IllegalCharacterError yerine
+# ValueError fırlatmasın). 32767 = Excel'in hücre üst sınırı.
+_EXCEL_CELL_MAX = 32767
 
 COLUMNS = [
     "Müşteri/Task Adı",
+    "Aşama",
     "Açıklama",
     "Son Yorum",
     "Bitiş Tarihi",
@@ -291,20 +294,39 @@ def task_in_window(task, watermark_ms):
     return False
 
 
-def _truncate(text):
-    if text is None:
+def _clean_cell(value):
+    """Hücre metnini hazırla: sondaki gereksiz boşluk/satır sonlarını rstrip
+    et (İÇ satır sonları KALIR — okunabilirlik için). Karakter cap'i YOK;
+    sadece Excel'in 32767 hard limitini aşarsa orada keser (openpyxl
+    patlamasın). Normal içerik tam yazılır."""
+    if value is None:
         return ""
-    text = str(text)
-    if len(text) > _TEXT_TRUNCATE:
-        return text[: _TEXT_TRUNCATE - 1] + "…"
+    text = str(value).rstrip()
+    if len(text) > _EXCEL_CELL_MAX:
+        return text[:_EXCEL_CELL_MAX]
     return text
 
 
+def get_status(task):
+    """Pipeline aşaması = task status adı.
+
+    Ham /list/{id}/task yanıtı status'u DICT döndürür: {"status": <ad>, ...}.
+    (MCP/bazı katmanlar string'e normalize edebildiği için her iki biçim de
+    desteklenir — Ders 1: varsayma, ikisini de karşıla.) Yoksa "".
+    """
+    st = task.get("status")
+    if isinstance(st, dict):
+        return _clean_cell(st.get("status") or "")
+    if isinstance(st, str):
+        return _clean_cell(st)
+    return ""
+
+
 def get_description(task):
-    """'Açıklama' (text) custom field'ının düz metin değerini döndür."""
+    """'Açıklama' (text) custom field'ının düz metin değerini döndür (tam metin)."""
     for cf in task.get("custom_fields", []) or []:
         if cf.get("id") == DESC_CF_ID:
-            return _truncate(cf.get("value") or "")
+            return _clean_cell(cf.get("value") or "")
     return ""
 
 
@@ -332,7 +354,7 @@ def fetch_comment_summary(session, task_id):
     comments = fetch_all_comments(session, task_id)
     if not comments:
         return "", "0"
-    latest = _truncate(_extract_comment_text(comments[0]))
+    latest = _clean_cell(_extract_comment_text(comments[0]))
     n = len(comments)
     count_str = f"{COMMENT_PAGE_CAP}+" if n >= COMMENT_PAGE_CAP else str(n)
     return latest, count_str
@@ -350,12 +372,13 @@ def build_rows(session, tasks):
     for t in ordered:
         latest_comment, comment_count = fetch_comment_summary(session, t.get("id"))
         rows.append([
-            t.get("name", ""),
+            _clean_cell(t.get("name")),
+            get_status(t),
             get_description(t),
             latest_comment,
             fmt_date(t.get("due_date")),
             fmt_datetime(t.get("date_updated")),
-            get_priority(t),
+            _clean_cell(get_priority(t)),
             comment_count,
         ])
         time.sleep(BASE_SLEEP)
