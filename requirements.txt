@@ -1,0 +1,7 @@
+requests
+openpyxl
+# Coalexus Pipeline raporu — TR resmi tatil kontrolü (dini bayramlar dahil).
+# 0.83 ile TR 2026 (Ramazan/Kurban) sınıflandırması doğrulandı.
+holidays>=0.83
+# zoneinfo Europe/Istanbul için (sistem tzdata'sı olmayan ortamlarda gerekli).
+tzdata

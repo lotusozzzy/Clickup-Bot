@@ -7,6 +7,9 @@ venv/
 .env
 due_date_snapshot.json
 snapshot_history/
+coalexus_pipeline_state.json
+coalexus_pipeline_state.json.tmp
+coalexus_pipeline.log
 cron.log
 cron_daily.log
 manual.log

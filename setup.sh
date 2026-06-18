@@ -50,7 +50,7 @@ python3 -m venv "$APP_DIR/venv"
 # shellcheck disable=SC1091
 source "$APP_DIR/venv/bin/activate"
 pip install --upgrade pip --quiet
-pip install --quiet requests openpyxl
+pip install --quiet -r "$APP_DIR/requirements.txt"
 
 echo "[4/7] run.sh, run_daily.sh, run_and_stop.sh ve run_daily_and_stop.sh yazılıyor..."
 # Manuel test / 7/24 açık sunucu cron'u için - kapanmaz (haftalık bakiye)
