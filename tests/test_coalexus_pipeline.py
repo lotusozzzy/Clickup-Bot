@@ -179,19 +179,29 @@ def _wire_main(mod, monkeypatch, *, tasks, holiday=None, send_raises=False,
         monkeypatch.setattr(mod, "fetch_all_tasks_strict", _raise_fetch)
     else:
         monkeypatch.setattr(mod, "fetch_all_tasks_strict", lambda s: tasks)
-    # build_rows'u gerçek (yorum çekmeyen) haliyle test etmek için comment'i stub'la
+    # build_rows'u gerçek (yorum çekmeyen) haliyle; comment + excel'i stub'la
     monkeypatch.setattr(mod, "fetch_all_comments", lambda s, tid: [])
+    monkeypatch.setattr(mod, "write_excel",
+                        lambda rows: "Coalexus Pipeline Update_TEST.xlsx")
     monkeypatch.setattr(mod, "time", _NoSleep())
 
-    sent = {"count": None}
+    sent = {"count": None, "recipients": None, "calls": 0}
 
-    def fake_send(dosya, row_count, is_bootstrap):
+    def fake_send(dosya, row_count, is_bootstrap, recipients=None):
+        sent["calls"] += 1
         if send_raises:
             raise RuntimeError("SMTP patladı")
         sent["count"] = row_count
+        sent["recipients"] = recipients
 
     monkeypatch.setattr(mod, "send_report_mail", fake_send)
     return sent
+
+
+def _in_window_task():
+    return {"id": "a", "name": "Yeni", "date_updated": str(FIXED_T0 - 100),
+            "date_created": str(FIXED_T0 - 100), "due_date": None,
+            "priority": None, "custom_fields": []}
 
 
 class _NoSleep:
@@ -367,3 +377,63 @@ def test_send_all_accepted_ok(monkeypatch, tmp_path):
     fake = _FakeSMTP({})  # boş dict = hepsi kabul
     monkeypatch.setattr(mod.smtplib, "SMTP_SSL", fake)
     mod.send_report_mail(None, 0, False)  # fırlatmamalı
+
+
+# ---------------------------------------------------------------------------
+# Test/override env'leri (DRY_RUN, RECIPIENT_OVERRIDE) — watermark ilerlememeli
+# ---------------------------------------------------------------------------
+def test_dry_run_skips_send_and_state(monkeypatch, tmp_path):
+    """DRY_RUN → send çağrılmaz, state YAZILMAZ (mevcut watermark korunur)."""
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    mod.save_state(1_000, "sent")
+    monkeypatch.setenv("DRY_RUN", "1")
+    sent = _wire_main(mod, monkeypatch, tasks=[_in_window_task()])
+    mod.main()
+    assert sent["calls"] == 0  # mail gönderilmedi
+    assert mod.load_state()["last_successful_run_ms"] == 1_000  # İLERLEMEDİ
+
+
+def test_recipient_override_sends_only_override_and_no_state(monkeypatch, tmp_path):
+    """RECIPIENT_OVERRIDE → sadece override alıcılara gider; state YAZILMAZ."""
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    mod.save_state(1_000, "sent")
+    monkeypatch.setenv("RECIPIENT_OVERRIDE", "me@test.com, you@test.com")
+    sent = _wire_main(mod, monkeypatch, tasks=[_in_window_task()])
+    mod.main()
+    assert sent["calls"] == 1
+    assert sent["recipients"] == ["me@test.com", "you@test.com"]  # sabit 3 DEĞİL
+    assert mod.load_state()["last_successful_run_ms"] == 1_000  # İLERLEMEDİ
+
+
+def test_clean_run_advances_state(monkeypatch, tmp_path):
+    """Kontrol: DRY_RUN/OVERRIDE YOKKEN watermark ilerler ve sabit alıcılara gider."""
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    mod.save_state(1_000, "sent")
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.delenv("RECIPIENT_OVERRIDE", raising=False)
+    sent = _wire_main(mod, monkeypatch, tasks=[_in_window_task()])
+    mod.main()
+    assert sent["recipients"] == mod.RECIPIENTS  # sabit 3 alıcı
+    assert mod.load_state()["last_successful_run_ms"] == FIXED_T0  # İLERLEDİ
+
+
+def test_parse_recipients(monkeypatch, tmp_path):
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    assert mod._parse_recipients("a@x.com, b@y.com ,, c@z.com") == [
+        "a@x.com", "b@y.com", "c@z.com"]
+    assert mod._parse_recipients("") == []
+    assert mod._parse_recipients(None) == []
+
+
+def test_write_excel_builds_file(monkeypatch, tmp_path):
+    """Gerçek write_excel kapsaması (flow testleri write_excel'i stub'lar)."""
+    import openpyxl
+    mod, _ = _import_module(monkeypatch, tmp_path)
+    monkeypatch.chdir(tmp_path)  # repo'yu kirletme
+    rows = [["Ad", "Açıklama", "Yorum", "01.01.2026", "01.01.2026 10:00",
+             "urgent", "2"]]
+    dosya = mod.write_excel(rows)
+    assert os.path.exists(dosya)
+    ws = openpyxl.load_workbook(dosya)["Pipeline"]
+    assert [c.value for c in ws[1]] == mod.COLUMNS
+    assert [c.value for c in ws[2]] == rows[0]

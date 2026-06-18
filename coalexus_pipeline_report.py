@@ -112,6 +112,21 @@ COLUMNS = [
 
 
 # ---------------------------------------------------------------------------
+# Test/override env'leri
+# ---------------------------------------------------------------------------
+def _env_truthy(name):
+    """Env değeri truthy mi (KEEP_EXCEL_ON_DISK ile aynı kural)."""
+    return os.environ.get(name, "").strip().lower() in ("true", "1", "yes", "on")
+
+
+def _parse_recipients(raw):
+    """Virgülle ayrılmış mail listesini temizleyip liste döndür. Boş → []."""
+    if not raw:
+        return []
+    return [addr.strip() for addr in raw.split(",") if addr.strip()]
+
+
+# ---------------------------------------------------------------------------
 # Zaman / state
 # ---------------------------------------------------------------------------
 def now_ms():
@@ -373,11 +388,11 @@ def write_excel(rows):
     return dosya
 
 
-def _build_mail(dosya, row_count, is_bootstrap):
+def _build_mail(dosya, row_count, is_bootstrap, recipients):
     konu_tarih = datetime.datetime.now().strftime("%d.%m.%Y")
     msg = MIMEMultipart()
     msg["From"] = GONDEREN_MAIL
-    msg["To"] = ", ".join(RECIPIENTS)
+    msg["To"] = ", ".join(recipients)
     msg["Subject"] = f"{REPORT_NAME} — {konu_tarih}"
 
     bootstrap_note = ""
@@ -423,12 +438,14 @@ def _build_mail(dosya, row_count, is_bootstrap):
     return msg
 
 
-def send_report_mail(dosya, row_count, is_bootstrap):
-    """Raporu Coalexus alıcılarına gönder. Başarısızlıkta exception fırlatır
-    (böylece watermark İLERLEMEZ). send_mail/excel_ve_mail rapora-özel
-    olduğu için import edilmedi; SMTP_SSL kalıbı burada yeniden kuruldu.
+def send_report_mail(dosya, row_count, is_bootstrap, recipients=None):
+    """Raporu verilen alıcılara gönder (None → sabit RECIPIENTS).
+    Başarısızlıkta exception fırlatır (böylece watermark İLERLEMEZ).
+    send_mail/excel_ve_mail rapora-özel olduğu için import edilmedi; SMTP_SSL
+    kalıbı burada yeniden kuruldu.
     """
-    msg = _build_mail(dosya, row_count, is_bootstrap)
+    recipients = recipients or RECIPIENTS
+    msg = _build_mail(dosya, row_count, is_bootstrap, recipients)
     with smtplib.SMTP_SSL(SMTP_SUNUCU, SMTP_PORT, timeout=30) as s:
         s.login(GONDEREN_MAIL, GONDEREN_SIFRE)
         # send_message TÜM alıcılar reddedilirse SMTPRecipientsRefused fırlatır,
@@ -437,7 +454,7 @@ def send_report_mail(dosya, row_count, is_bootstrap):
         refused = s.send_message(msg)
     if refused:
         raise smtplib.SMTPRecipientsRefused(refused)
-    log(f"✨ Mail gönderildi → {', '.join(RECIPIENTS)}")
+    log(f"✨ Mail gönderildi → {', '.join(recipients)}")
 
 
 # ---------------------------------------------------------------------------
@@ -471,26 +488,49 @@ def main():
     filtered = [t for t in tasks if task_in_window(t, watermark)]
     log(f"🔎 Pencere içi (güncellenen/oluşturulan): {len(filtered)} task.")
 
+    # Test/override modu: DRY_RUN (mail atma) veya RECIPIENT_OVERRIDE (alıcıyı
+    # değiştir) set ise bu bir TEST'tir → watermark İLERLEMEZ (mail başarılı
+    # olsa bile). Watermark yalnız TEMİZ gerçek run'da (ikisi de yok) +
+    # mail başarısında ilerler; böylece testler ilk gerçek cron penceresini
+    # etkilemez (state ilk kez gerçek cron run'ında yazılır).
+    dry_run = _env_truthy("DRY_RUN")
+    override = _parse_recipients(os.environ.get("RECIPIENT_OVERRIDE"))
+    test_mode = dry_run or bool(override)
+    recipients = override or RECIPIENTS
+    # DRY_RUN'da Excel incelensin diye diskte tutulur.
+    keep_excel = KEEP_EXCEL_ON_DISK or dry_run
+
     # 5) Satırlar + Excel
     rows = build_rows(session, filtered)
     dosya = write_excel(rows) if rows else None
 
-    # 6-7) Mail + watermark. save_state SADECE send başarılıysa (try içinde,
-    #      send'den SONRA) çağrılır → watermark yalnız başarıda ilerler. Excel
-    #      temizliği finally'de — send fail etse de dosya diskte kalmaz.
+    # 6-7) Mail + watermark. save_state SADECE send başarılıysa VE temiz gerçek
+    #      run'da çağrılır → watermark yalnız başarıda ilerler. Excel temizliği
+    #      finally'de — send fail etse de dosya diskte kalmaz (DRY_RUN hariç).
     try:
-        send_report_mail(dosya, len(rows), is_bootstrap)
-        save_state(t0, "sent" if rows else "no_change")
-        log(f"✅ Watermark T0={t0} kaydedildi "
-            f"(status={'sent' if rows else 'no_change'}).")
+        if dry_run:
+            log(f"🧪 DRY_RUN: mail atlandı, watermark ilerletilmedi. "
+                f"(Excel: {dosya or '(satır yok)'})")
+        else:
+            if test_mode:
+                log(f"🧪 RECIPIENT_OVERRIDE aktif → sadece "
+                    f"{', '.join(recipients)} (test, watermark ilerletilmeyecek).")
+            send_report_mail(dosya, len(rows), is_bootstrap, recipients)
+            if test_mode:
+                log("🧪 Test gönderimi tamam; watermark ilerletilmedi.")
+            else:
+                save_state(t0, "sent" if rows else "no_change")
+                log(f"✅ Watermark T0={t0} kaydedildi "
+                    f"(status={'sent' if rows else 'no_change'}).")
     finally:
-        if dosya and not KEEP_EXCEL_ON_DISK:
+        if dosya and not keep_excel:
             try:
                 os.remove(dosya)
             except OSError as e:
                 log(f"⚠️ Excel silinemedi ({e}).")
         elif dosya:
-            log(f"📁 KEEP_EXCEL_ON_DISK=true → '{dosya}' diskte tutuluyor.")
+            log(f"📁 Excel diskte tutuluyor → '{dosya}' "
+                f"(KEEP_EXCEL_ON_DISK veya DRY_RUN).")
 
     log("✅ İşlem tamamlandı.")
 
