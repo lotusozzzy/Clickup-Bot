@@ -18,7 +18,6 @@ import datetime
 import json
 import os
 import signal
-import smtplib
 import sys
 import time
 from email import encoders
@@ -39,12 +38,12 @@ from clickup_bot import (
     MAX_PAGES_PER_LIST,
     SF_GRAY,
     SF_ORANGE,
-    SMTP_PORT,
-    SMTP_SUNUCU,
     WORKSPACE_ID,
     _WatchdogTimeout,
     _watchdog_handler,
+    append_report_row,
     get_session,
+    get_smtp_connection,
     log,
     safe_get,
 )
@@ -418,7 +417,7 @@ def _add_sheet(wb, title, headers, rows, table_name, header_fill, header_font,
     ws.row_dimensions[1].height = 30
 
     for row in rows:
-        ws.append(row)
+        append_report_row(ws, row)
 
     # Boş tabloda da en az "veri yok" satırı kalsın - okurken kafa karıştırmasın.
     if not rows:
@@ -574,7 +573,7 @@ def send_mail(dosya, me_info, summary, is_first_run):
         part.add_header("Content-Disposition", f"attachment; filename={dosya}")
         msg.attach(part)
 
-    with smtplib.SMTP_SSL(SMTP_SUNUCU, SMTP_PORT, timeout=30) as s:
+    with get_smtp_connection(timeout=30) as s:
         s.login(GONDEREN_MAIL, GONDEREN_SIFRE)
         s.send_message(msg)
     log("✨ Mail gönderildi.")

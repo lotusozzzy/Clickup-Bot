@@ -5,10 +5,12 @@ import datetime
 import re
 import signal
 import smtplib
+import ssl
 import sys
 import time
 import os
 import openpyxl
+from openpyxl.cell import Cell
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from email.mime.multipart import MIMEMultipart
@@ -71,6 +73,14 @@ class _WatchdogTimeout(Exception):
 
 def _watchdog_handler(signum, frame):
     raise _WatchdogTimeout()
+
+
+def get_smtp_connection(timeout):
+    """Posta sunucusunun sertifikasını ve adını doğrulayarak bağlan."""
+    return smtplib.SMTP_SSL(
+        SMTP_SUNUCU, SMTP_PORT, timeout=timeout,
+        context=ssl.create_default_context(),
+    )
 
 
 def get_session():
@@ -358,6 +368,19 @@ def verileri_cek_ve_raporla():
     return raporlanacak_cariler, atlanan_listeler
 
 
+def append_report_row(ws, values):
+    """Dış metinleri formüle çevirmeden yaz; sayıların türünü koru."""
+    row = []
+    for value in values:
+        if isinstance(value, str):
+            cell = Cell(ws, value=value)
+            cell.data_type = "s"
+            row.append(cell)
+        else:
+            row.append(value)
+    ws.append(row)
+
+
 def excel_ve_mail(veriler, atlanan_listeler=None):
     atlanan_listeler = atlanan_listeler or []
     if not veriler and not atlanan_listeler:
@@ -380,7 +403,7 @@ def excel_ve_mail(veriler, atlanan_listeler=None):
                          top=Side(style='thin', color="D3D3D3"),
                          bottom=Side(style='thin', color="D3D3D3"))
 
-    for sirket_adi, cari_listesi in sirket_gruplari.items():
+    for sirket_index, (sirket_adi, cari_listesi) in enumerate(sirket_gruplari.items(), 1):
         safe_sheet_name = re.sub(r'[\\/*?:\[\]]', '', sirket_adi)[:31]
         if not safe_sheet_name:
             safe_sheet_name = "Bilinmeyen"
@@ -402,7 +425,7 @@ def excel_ve_mail(veriler, atlanan_listeler=None):
         ws.row_dimensions[1].height = 30
 
         for cari in cari_listesi:
-            ws.append([cari['ad'], cari['sirket'], cari['bakiye']])
+            append_report_row(ws, [cari['ad'], cari['sirket'], cari['bakiye']])
 
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=3):
             for cell in row:
@@ -436,11 +459,7 @@ def excel_ve_mail(veriler, atlanan_listeler=None):
             ws.column_dimensions[col_letter].width = min(width, 40)
 
         tablo_ref = f"A1:C{ws.max_row}"
-        tablo_ismi = "Tbl_" + re.sub(r'[^a-zA-Z0-9]', '', sirket_adi)
-        if tablo_ismi == "Tbl_":
-            tablo_ismi = "Tbl_Sirket_" + str(id(sirket_adi))
-
-        tab = Table(displayName=tablo_ismi[:255], ref=tablo_ref)
+        tab = Table(displayName=f"Tbl_Sirket_{sirket_index}", ref=tablo_ref)
         style = TableStyleInfo(name="TableStyleLight1", showFirstColumn=False,
                                showLastColumn=False, showRowStripes=True, showColumnStripes=False)
         tab.tableStyleInfo = style
@@ -462,7 +481,7 @@ def excel_ve_mail(veriler, atlanan_listeler=None):
         ws_skip.row_dimensions[1].height = 30
 
         for item in atlanan_listeler:
-            ws_skip.append([item["ad"], item["sebep"]])
+            append_report_row(ws_skip, [item["ad"], item["sebep"]])
 
         for row in ws_skip.iter_rows(min_row=2, max_row=ws_skip.max_row,
                                      min_col=1, max_col=2):
@@ -531,7 +550,7 @@ def excel_ve_mail(veriler, atlanan_listeler=None):
     msg.attach(part)
 
     try:
-        with smtplib.SMTP_SSL(SMTP_SUNUCU, SMTP_PORT, timeout=20) as s:
+        with get_smtp_connection(timeout=20) as s:
             s.login(GONDEREN_MAIL, GONDEREN_SIFRE)
             s.send_message(msg)
         log("✨ Şirket bazlı, dinamik tablolu kurumsal rapor gönderildi!")
